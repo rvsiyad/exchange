@@ -1,0 +1,103 @@
+name: exchange
+
+services:
+  redpanda:
+    image: redpandadata/redpanda:latest
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --overprovisioned
+      - --node-id=0
+      # Two listeners: `internal` for containers on this network (redpanda:29092),
+      # `external` advertised as localhost:9092 for the JVM services running on the host.
+      - --kafka-addr=internal://0.0.0.0:29092,external://0.0.0.0:9092
+      - --advertise-kafka-addr=internal://redpanda:29092,external://localhost:9092
+    ports:
+      - "9092:9092"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  redpanda-init:
+    image: redpandadata/redpanda:latest
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "rpk topic create orders --partitions 4 -X brokers=redpanda:29092 || true;
+       rpk topic create fills --partitions 1 -X brokers=redpanda:29092 || true;
+       rpk topic create book-updates --partitions 1 -X brokers=redpanda:29092 || true;
+       rpk topic list -X brokers=redpanda:29092"
+
+  console:
+    image: redpandadata/console:latest
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    environment:
+      KAFKA_BROKERS: redpanda:29092
+    ports:
+      - "8080:8080"
+
+  tigerbeetle:
+    image: ghcr.io/tigerbeetle/tigerbeetle:0.16.27
+    # Single replica (--replica-count=1) is a dev-only topology; production runs 6.
+    # Format once if the datafile doesn't exist, then start.
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "ls /data/0_0.tigerbeetle 2>/dev/null
+       || /tigerbeetle format --cluster=0 --replica=0 --replica-count=1 /data/0_0.tigerbeetle;
+       exec /tigerbeetle start --addresses=0.0.0.0:3000 /data/0_0.tigerbeetle"
+    ports:
+      - "3000:3000"
+    volumes:
+      - tigerbeetle-data:/data
+    security_opt:
+      - seccomp=unconfined
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: exchange
+      POSTGRES_USER: exchange
+      POSTGRES_PASSWORD: exchange
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U exchange"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  redpanda-data:
+  tigerbeetle-data:
+  postgres-data:

@@ -1,0 +1,18 @@
+global:
+  scrape_interval: 5s
+
+# The four JVM services run on the host during development; host.docker.internal
+# is how a container reaches them. /metrics endpoints land in session 6.
+scrape_configs:
+  - job_name: gateway
+    static_configs:
+      - targets: ["host.docker.internal:7001"]
+  - job_name: engine
+    static_configs:
+      - targets: ["host.docker.internal:7002"]
+  - job_name: settlement
+    static_configs:
+      - targets: ["host.docker.internal:7003"]
+  - job_name: market-data
+    static_configs:
+      - targets: ["host.docker.internal:7004"]

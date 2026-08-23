@@ -50,10 +50,10 @@ services:
     # Single replica (--replica-count=1) is a dev-only topology; production runs 6.
     # Format once if the datafile doesn't exist, then start.
     entrypoint: ["/bin/sh", "-c"]
-    command: >
-      "ls /data/0_0.tigerbeetle 2>/dev/null
-       || /tigerbeetle format --cluster=0 --replica=0 --replica-count=1 /data/0_0.tigerbeetle;
-       exec /tigerbeetle start --addresses=0.0.0.0:3000 /data/0_0.tigerbeetle"
+    command:
+      - |
+        ls /data/0_0.tigerbeetle 2>/dev/null || /tigerbeetle format --cluster=0 --replica=0 --replica-count=1 /data/0_0.tigerbeetle
+        exec /tigerbeetle start --addresses=0.0.0.0:3000 /data/0_0.tigerbeetle
     ports:
       - "3000:3000"
     volumes:

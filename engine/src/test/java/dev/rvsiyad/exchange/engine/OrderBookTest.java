@@ -238,6 +238,20 @@ class OrderBookTest {
     }
 
     @Test
+    void depthAggregatesLevelsBestPriceFirst() {
+        buy("b1", "alice", 100_00, 3);
+        buy("b2", "bob", 99_00, 1);
+        buy("b3", "carol", 100_00, 2);
+        sell("s1", "dan", 101_00, 4);
+
+        assertEquals(
+                List.of(new OrderBook.Level(100_00, 5), new OrderBook.Level(99_00, 1)),
+                book.depth(Side.BUY, 10));
+        assertEquals(List.of(new OrderBook.Level(101_00, 4)), book.depth(Side.SELL, 10));
+        assertEquals(List.of(new OrderBook.Level(100_00, 5)), book.depth(Side.BUY, 1));
+    }
+
+    @Test
     void replayingTheSameCommandsProducesIdenticalFills() {
         var commands = List.of(
                 OrderCommand.newOrder("s1", "bob", "BTC-USD", Side.SELL, 100_50, 2, 1),

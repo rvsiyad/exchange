@@ -128,6 +128,26 @@ public final class OrderBook {
         return asks.isEmpty() ? null : asks.firstKey();
     }
 
+    /** One aggregated price level of book depth. */
+    public record Level(long priceTicks, long quantity) {
+    }
+
+    /** Aggregated depth for one side, best price first, at most maxLevels levels. */
+    public List<Level> depth(Side side, int maxLevels) {
+        var levels = new ArrayList<Level>();
+        for (var entry : sideOf(side).entrySet()) {
+            if (levels.size() == maxLevels) {
+                break;
+            }
+            long total = 0;
+            for (var order : entry.getValue()) {
+                total += order.remaining;
+            }
+            levels.add(new Level(entry.getKey(), total));
+        }
+        return levels;
+    }
+
     /** Total quantity resting at one price level; 0 if the level does not exist. */
     public long depthAt(Side side, long priceTicks) {
         var queue = sideOf(side).get(priceTicks);

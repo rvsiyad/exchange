@@ -1,5 +1,7 @@
 # exchange
 
+[![CI](https://github.com/rvsiyad/exchange/actions/workflows/ci.yml/badge.svg)](https://github.com/rvsiyad/exchange/actions/workflows/ci.yml)
+
 A mini trading venue. Clients place orders through a REST gateway, an event-sourced
 in-memory matching engine crosses them over Kafka, fills settle atomically as
 two-phase transfers in TigerBeetle, and a market-data service streams the live

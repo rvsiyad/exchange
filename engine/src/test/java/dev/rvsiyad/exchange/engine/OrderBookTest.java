@@ -307,6 +307,32 @@ class OrderBookTest {
     }
 
     @Test
+    void restoredBookContinuesExactlyWhereTheOriginalLeftOff() {
+        sell("s1", "bob", 100_00, 2);
+        sell("s2", "carol", 100_00, 3);   // same level, behind bob in time priority
+        buy("b1", "alice", 100_00, 1);    // fill 1: partially takes bob
+        buy("b2", "dave", 99_00, 4);      // rests on the other side
+
+        var restored = OrderBook.restore(book.snapshot());
+
+        // FIFO preserved: bob's remaining 1 trades before carol's 3.
+        var fills = restored.apply(
+                OrderCommand.newOrder("b3", "erin", "BTC-USD", Side.BUY, 100_00, 2, ++clock)).fills();
+        assertEquals(2, fills.size());
+        assertEquals("bob", fills.get(0).makerUserId());
+        assertEquals(1, fills.get(0).quantity());
+        assertEquals("carol", fills.get(1).makerUserId());
+        // Fill sequence continues: the pre-snapshot fill was BTC-USD-1.
+        assertEquals("BTC-USD-2", fills.get(0).fillId());
+        assertEquals("BTC-USD-3", fills.get(1).fillId());
+        // Seen order ids survive: replaying an old command is still a no-op.
+        assertTrue(restored.apply(
+                OrderCommand.newOrder("b1", "alice", "BTC-USD", Side.BUY, 100_00, 1, ++clock)).fills().isEmpty());
+        // The untouched side survives too.
+        assertEquals(4, restored.depthAt(Side.BUY, 99_00));
+    }
+
+    @Test
     void replayingTheSameCommandsProducesIdenticalFills() {
         var commands = List.of(
                 OrderCommand.newOrder("s1", "bob", "BTC-USD", Side.SELL, 100_50, 2, 1),

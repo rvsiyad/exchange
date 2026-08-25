@@ -184,6 +184,44 @@ public final class OrderBook {
         return total;
     }
 
+    /**
+     * Serializable state of the whole book for snapshot + restore. Resting
+     * orders are listed in side, then price, then FIFO order, so restoring
+     * preserves time priority exactly.
+     */
+    public record BookState(String symbol, long fillSequence, Set<String> seenOrderIds,
+                            List<RestingOrderState> restingOrders) {
+    }
+
+    public record RestingOrderState(String orderId, String userId, Side side, long priceTicks, long remaining) {
+    }
+
+    public BookState snapshot() {
+        var resting = new ArrayList<RestingOrderState>();
+        for (var levels : List.of(bids, asks)) {
+            for (var queue : levels.values()) {
+                for (var order : queue) {
+                    resting.add(new RestingOrderState(
+                            order.orderId, order.userId, order.side, order.priceTicks, order.remaining));
+                }
+            }
+        }
+        return new BookState(symbol, fillSequence, Set.copyOf(seenOrderIds), resting);
+    }
+
+    public static OrderBook restore(BookState state) {
+        var book = new OrderBook(state.symbol());
+        book.fillSequence = state.fillSequence();
+        book.seenOrderIds.addAll(state.seenOrderIds());
+        for (var order : state.restingOrders()) {
+            var resting = new RestingOrder(
+                    order.orderId(), order.userId(), order.side(), order.priceTicks(), order.remaining());
+            book.sideOf(order.side()).computeIfAbsent(order.priceTicks(), p -> new ArrayDeque<>()).addLast(resting);
+            book.byOrderId.put(order.orderId(), resting);
+        }
+        return book;
+    }
+
     private static final class RestingOrder {
         final String orderId;
         final String userId;

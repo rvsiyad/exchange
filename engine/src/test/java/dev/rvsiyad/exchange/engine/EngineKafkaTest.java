@@ -20,10 +20,12 @@ import org.apache.kafka.common.serialization.StringDeserializer;
 import org.apache.kafka.common.serialization.StringSerializer;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.redpanda.RedpandaContainer;
 
+import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -59,6 +61,14 @@ class EngineKafkaTest {
         }
     }
 
+    @TempDir
+    static Path tempDir;
+
+    /** A fresh snapshot dir per engine instance: this test exercises the no-snapshot full-replay path. */
+    private static Engine newEngine(String name) {
+        return new Engine(bootstrap, tempDir.resolve(name), Integer.MAX_VALUE);
+    }
+
     @Test
     void matchesOverKafkaAndReplaysDeterministicallyOnRestart() {
         try (var producer = new KafkaProducer<String, byte[]>(producerConfig())) {
@@ -71,7 +81,7 @@ class EngineKafkaTest {
         }
 
         List<Fill> firstRun;
-        try (var engine = new Engine(bootstrap)) {
+        try (var engine = newEngine("first-run")) {
             engine.start();
 
             firstRun = consume(Topics.FILLS, 2, bytes -> Json.fromBytes(bytes, Fill.class));
@@ -100,7 +110,7 @@ class EngineKafkaTest {
 
         // A fresh engine replays the whole log and re-emits byte-identical fills:
         // at-least-once by design, deduplicated downstream by deterministic fill id.
-        try (var engine = new Engine(bootstrap)) {
+        try (var engine = newEngine("second-run")) {
             engine.start();
             var afterRestart = consume(Topics.FILLS, 4, bytes -> Json.fromBytes(bytes, Fill.class));
             var replayed = afterRestart.subList(2, 4);

@@ -112,7 +112,7 @@ public final class DemoServerMain {
             var orderId = "o-" + ++orderSequence;
             var fills = book.apply(OrderCommand.newOrder(
                     orderId, request.userId(), SYMBOL, request.side(),
-                    request.priceTicks(), request.quantity(), System.nanoTime()));
+                    request.priceTicks(), request.quantity(), System.nanoTime())).fills();
             for (var fill : fills) {
                 recentTrades.addFirst(new Trade(fill.priceTicks(), fill.quantity(), fill.takerSide(), ++tradeSequence));
             }

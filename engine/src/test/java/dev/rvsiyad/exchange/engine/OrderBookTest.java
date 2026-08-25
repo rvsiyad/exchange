@@ -1,5 +1,6 @@
 package dev.rvsiyad.exchange.engine;
 
+import dev.rvsiyad.exchange.common.BookUpdate;
 import dev.rvsiyad.exchange.common.Fill;
 import dev.rvsiyad.exchange.common.OrderCommand;
 import dev.rvsiyad.exchange.common.Side;
@@ -26,15 +27,15 @@ class OrderBookTest {
     }
 
     private List<Fill> buy(String orderId, String userId, long priceTicks, long quantity) {
-        return book.apply(OrderCommand.newOrder(orderId, userId, "BTC-USD", Side.BUY, priceTicks, quantity, ++clock));
+        return book.apply(OrderCommand.newOrder(orderId, userId, "BTC-USD", Side.BUY, priceTicks, quantity, ++clock)).fills();
     }
 
     private List<Fill> sell(String orderId, String userId, long priceTicks, long quantity) {
-        return book.apply(OrderCommand.newOrder(orderId, userId, "BTC-USD", Side.SELL, priceTicks, quantity, ++clock));
+        return book.apply(OrderCommand.newOrder(orderId, userId, "BTC-USD", Side.SELL, priceTicks, quantity, ++clock)).fills();
     }
 
     private List<Fill> cancel(String orderId, String userId) {
-        return book.apply(OrderCommand.cancel(orderId, userId, "BTC-USD", ++clock));
+        return book.apply(OrderCommand.cancel(orderId, userId, "BTC-USD", ++clock)).fills();
     }
 
     @Test
@@ -213,9 +214,10 @@ class OrderBookTest {
     void redeliveredNewCommandIsANoOp() {
         var cmd = OrderCommand.newOrder("b1", "alice", "BTC-USD", Side.BUY, 100_00, 3, ++clock);
         book.apply(cmd);
-        var fills = book.apply(cmd);
+        var result = book.apply(cmd);
 
-        assertTrue(fills.isEmpty());
+        assertTrue(result.fills().isEmpty());
+        assertTrue(result.bookUpdates().isEmpty());
         assertEquals(3, book.depthAt(Side.BUY, 100_00));
     }
 
@@ -233,8 +235,9 @@ class OrderBookTest {
     void fillTimestampsComeFromTheTakerCommand() {
         sell("s1", "bob", 100_00, 2);
         var taker = OrderCommand.newOrder("b1", "alice", "BTC-USD", Side.BUY, 100_00, 2, 42_000L);
-        var fills = book.apply(taker);
-        assertEquals(42_000L, fills.get(0).timestampNanos());
+        var result = book.apply(taker);
+        assertEquals(42_000L, result.fills().get(0).timestampNanos());
+        assertEquals(42_000L, result.bookUpdates().get(0).timestampNanos());
     }
 
     @Test
@@ -252,6 +255,58 @@ class OrderBookTest {
     }
 
     @Test
+    void restingOrderEmitsADeltaForItsOwnLevel() {
+        var result = book.apply(OrderCommand.newOrder("b1", "alice", "BTC-USD", Side.BUY, 100_00, 3, ++clock));
+
+        assertEquals(
+                List.of(new BookUpdate("BTC-USD", Side.BUY, 100_00, 3, clock)),
+                result.bookUpdates());
+    }
+
+    @Test
+    void sweepEmitsOneDeltaPerTouchedLevelInConsumeOrder() {
+        sell("s1", "bob", 100_50, 2);
+        sell("s2", "carol", 101_00, 5);
+        var result = book.apply(OrderCommand.newOrder("b1", "dave", "BTC-USD", Side.BUY, 101_00, 4, ++clock));
+
+        // Bob's level is emptied, Carol's is reduced; nothing rested so no BUY delta.
+        assertEquals(
+                List.of(
+                        new BookUpdate("BTC-USD", Side.SELL, 100_50, 0, clock),
+                        new BookUpdate("BTC-USD", Side.SELL, 101_00, 3, clock)),
+                result.bookUpdates());
+    }
+
+    @Test
+    void partialFillEmitsMakerLevelThenRestingTakerLevel() {
+        sell("s1", "bob", 100_00, 2);
+        var result = book.apply(OrderCommand.newOrder("b1", "alice", "BTC-USD", Side.BUY, 100_00, 5, ++clock));
+
+        assertEquals(
+                List.of(
+                        new BookUpdate("BTC-USD", Side.SELL, 100_00, 0, clock),
+                        new BookUpdate("BTC-USD", Side.BUY, 100_00, 3, clock)),
+                result.bookUpdates());
+    }
+
+    @Test
+    void cancelEmitsTheRemainingDepthAtItsLevel() {
+        sell("s1", "bob", 100_00, 2);
+        sell("s2", "carol", 100_00, 3);
+        var result = book.apply(OrderCommand.cancel("s1", "bob", "BTC-USD", ++clock));
+
+        assertEquals(
+                List.of(new BookUpdate("BTC-USD", Side.SELL, 100_00, 3, clock)),
+                result.bookUpdates());
+    }
+
+    @Test
+    void cancelOfUnknownOrderEmitsNoDeltas() {
+        var result = book.apply(OrderCommand.cancel("nope", "mallory", "BTC-USD", ++clock));
+        assertTrue(result.bookUpdates().isEmpty());
+    }
+
+    @Test
     void replayingTheSameCommandsProducesIdenticalFills() {
         var commands = List.of(
                 OrderCommand.newOrder("s1", "bob", "BTC-USD", Side.SELL, 100_50, 2, 1),
@@ -265,10 +320,10 @@ class OrderBookTest {
         var bookA = new OrderBook("BTC-USD");
         var bookB = new OrderBook("BTC-USD");
         for (var cmd : commands) {
-            firstRun.addAll(bookA.apply(cmd));
+            firstRun.addAll(bookA.apply(cmd).fills());
         }
         for (var cmd : commands) {
-            secondRun.addAll(bookB.apply(cmd));
+            secondRun.addAll(bookB.apply(cmd).fills());
         }
 
         assertFalse(firstRun.isEmpty());

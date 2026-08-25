@@ -11,16 +11,23 @@ order book to a dashboard over WebSockets.
 
 ## Demo
 
-A walking-skeleton demo serves a crude web UI directly on the real matching engine
-in a single process — no Kafka or TigerBeetle yet; later sessions swap those in
-behind the same UI contract:
+The demo UI runs on the real event-sourced pipeline: orders enter through the
+gateway, cross in the engine, and the book you see is projected back out of the
+log by market-data — **gateway → Kafka → engine → Kafka → market-data**. (The
+session-2.5 walking skeleton ran the same UI directly on the in-process matcher;
+the guts were swapped without changing the UI contract.)
 
 ```
-./mvnw -pl engine -am compile
-./mvnw -pl engine exec:java -Dexec.mainClass=dev.rvsiyad.exchange.engine.demo.DemoServerMain
+docker compose up -d redpanda redpanda-init
+./mvnw -q compile
+./mvnw -q -pl engine exec:java &
+./mvnw -q -pl gateway exec:java &
+./mvnw -q -pl market-data exec:java
 ```
 
-Then open http://localhost:8090 (port configurable via `DEMO_PORT`).
+Then open http://localhost:8090. Ports/config via `KAFKA_BOOTSTRAP`,
+`GATEWAY_PORT` (8091), `MARKET_DATA_PORT` (8090), `GATEWAY_URL`,
+`ENGINE_SNAPSHOT_DIR`, `ENGINE_SNAPSHOT_EVERY`.
 
 ## Design
 

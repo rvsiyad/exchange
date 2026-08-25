@@ -18,6 +18,11 @@ import org.apache.kafka.common.serialization.StringSerializer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -31,22 +36,35 @@ import java.util.Properties;
  * single-writer principle — ordering and parallelism both come from Kafka
  * partitioning (key = symbol), so no lock ever guards a book.
  *
- * The `orders` topic is the write-ahead log and, for now, the only durability:
- * every start seeks to the beginning and replays. Because the book is
- * deterministic, replay rebuilds identical state — and re-emits identical
- * fills, which downstream consumers must (and do, by deterministic fill id)
- * treat idempotently. Snapshot + seek arrives next to bound replay time.
+ * The `orders` topic is the write-ahead log: matching state lives in memory
+ * and durability comes from replay. Each worker periodically snapshots its
+ * books together with the next offset to consume — one atomically-replaced
+ * file per partition — so a restart is load + seek + replay-the-tail instead
+ * of replaying history. The offset lives inside the snapshot, never in Kafka,
+ * because a committed offset without the matching book state loses orders.
+ *
+ * Commands replayed after the snapshot point re-emit identical fills (the
+ * book is deterministic); downstream consumers dedupe by fill id —
+ * at-least-once delivery, exactly-once effect.
  */
 public final class Engine implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(Engine.class);
 
     private final String bootstrapServers;
+    private final Path snapshotDir;
+    private final int snapshotEveryCommands;
     private final List<Worker> workers = new ArrayList<>();
     private final List<Thread> threads = new ArrayList<>();
 
-    public Engine(String bootstrapServers) {
+    public Engine(String bootstrapServers, Path snapshotDir, int snapshotEveryCommands) {
         this.bootstrapServers = bootstrapServers;
+        this.snapshotDir = snapshotDir;
+        this.snapshotEveryCommands = snapshotEveryCommands;
+    }
+
+    /** What one partition's snapshot file holds: every book plus the offset replay resumes from. */
+    record PartitionSnapshot(long nextOffset, List<OrderBook.BookState> books) {
     }
 
     public void start() {
@@ -102,13 +120,17 @@ public final class Engine implements AutoCloseable {
     private final class Worker implements Runnable {
 
         private final TopicPartition partition;
+        private final Path snapshotPath;
         private final KafkaConsumer<String, byte[]> consumer;
         private final KafkaProducer<String, byte[]> producer;
         private final Map<String, OrderBook> books = new HashMap<>();
+        private long nextOffset;
+        private int commandsSinceSnapshot;
         private volatile boolean running = true;
 
         Worker(int partition) {
             this.partition = new TopicPartition(Topics.ORDERS, partition);
+            this.snapshotPath = snapshotDir.resolve(Topics.ORDERS + "-" + partition + ".json");
             this.consumer = new KafkaConsumer<>(consumerConfig());
             this.producer = new KafkaProducer<>(producerConfig());
         }
@@ -117,7 +139,17 @@ public final class Engine implements AutoCloseable {
         public void run() {
             try {
                 consumer.assign(List.of(partition));
-                consumer.seekToBeginning(List.of(partition));
+                var snapshot = loadSnapshot();
+                if (snapshot != null) {
+                    snapshot.books().forEach(state -> books.put(state.symbol(), OrderBook.restore(state)));
+                    nextOffset = snapshot.nextOffset();
+                    consumer.seek(partition, nextOffset);
+                    log.info("{}: restored {} books from snapshot, replaying from offset {}",
+                            partition, books.size(), nextOffset);
+                } else {
+                    consumer.seekToBeginning(List.of(partition));
+                    log.info("{}: no snapshot, replaying from the beginning", partition);
+                }
                 while (running) {
                     for (var record : consumer.poll(Duration.ofMillis(250)).records(partition)) {
                         handle(record);
@@ -128,25 +160,65 @@ public final class Engine implements AutoCloseable {
                     throw e;
                 }
             } finally {
+                writeSnapshot();
                 consumer.close();
                 producer.close();
             }
         }
 
         private void handle(ConsumerRecord<String, byte[]> record) {
-            OrderCommand command;
+            OrderCommand command = null;
             try {
                 command = Json.fromBytes(record.value(), OrderCommand.class);
             } catch (RuntimeException e) {
                 log.warn("skipping undecodable record at {} offset {}", partition, record.offset());
-                return;
             }
-            var result = books.computeIfAbsent(command.symbol(), OrderBook::new).apply(command);
-            for (var fill : result.fills()) {
-                producer.send(new ProducerRecord<>(Topics.FILLS, fill.symbol(), Json.toBytes(fill)));
+            if (command != null) {
+                var result = books.computeIfAbsent(command.symbol(), OrderBook::new).apply(command);
+                for (var fill : result.fills()) {
+                    producer.send(new ProducerRecord<>(Topics.FILLS, fill.symbol(), Json.toBytes(fill)));
+                }
+                for (var update : result.bookUpdates()) {
+                    producer.send(new ProducerRecord<>(Topics.BOOK_UPDATES, update.symbol(), Json.toBytes(update)));
+                }
             }
-            for (var update : result.bookUpdates()) {
-                producer.send(new ProducerRecord<>(Topics.BOOK_UPDATES, update.symbol(), Json.toBytes(update)));
+            nextOffset = record.offset() + 1;
+            if (++commandsSinceSnapshot >= snapshotEveryCommands) {
+                writeSnapshot();
+            }
+        }
+
+        private PartitionSnapshot loadSnapshot() {
+            if (!Files.exists(snapshotPath)) {
+                return null;
+            }
+            try {
+                return Json.fromBytes(Files.readAllBytes(snapshotPath), PartitionSnapshot.class);
+            } catch (IOException | RuntimeException e) {
+                log.warn("{}: snapshot {} unreadable, falling back to full replay", partition, snapshotPath, e);
+                return null;
+            }
+        }
+
+        /**
+         * Fills are flushed before the snapshot is written: state must never
+         * claim an offset whose fills could still be lost. The write itself is
+         * temp-file + atomic move, so a crash mid-write leaves the old
+         * snapshot intact.
+         */
+        private void writeSnapshot() {
+            commandsSinceSnapshot = 0;
+            producer.flush();
+            var state = new PartitionSnapshot(
+                    nextOffset,
+                    books.values().stream().map(OrderBook::snapshot).toList());
+            try {
+                Files.createDirectories(snapshotDir);
+                var temp = snapshotPath.resolveSibling(snapshotPath.getFileName() + ".tmp");
+                Files.write(temp, Json.toBytes(state));
+                Files.move(temp, snapshotPath, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+            } catch (IOException e) {
+                throw new UncheckedIOException("failed to write snapshot " + snapshotPath, e);
             }
         }
 

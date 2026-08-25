@@ -36,3 +36,6 @@ is an anti-pattern; durability comes from the Kafka event log plus snapshots, th
 same architecture real exchanges use. Money correctness is delegated to a
 purpose-built ledger database that enforces balance invariants itself. Built in
 Java 21 as a Maven multi-module monorepo.
+
+Decisions are written up as ADRs in [docs/adr](docs/adr); the running lab
+notebook is [docs/LEARNING.md](docs/LEARNING.md).

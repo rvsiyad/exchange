@@ -1,5 +1,6 @@
 package dev.rvsiyad.exchange.engine;
 
+import dev.rvsiyad.exchange.common.BookUpdate;
 import dev.rvsiyad.exchange.common.CommandType;
 import dev.rvsiyad.exchange.common.Fill;
 import dev.rvsiyad.exchange.common.OrderCommand;
@@ -10,6 +11,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.Deque;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.HashSet;
@@ -23,6 +25,10 @@ import java.util.TreeMap;
  * ids come from a per-book sequence, so replaying the same commands into a fresh
  * book yields byte-identical fills. That determinism is what snapshot+replay
  * recovery relies on.
+ *
+ * Each applied command also reports the depth deltas it caused (one BookUpdate
+ * per touched price level), so a market-data consumer can maintain a live book
+ * without ever seeing this data structure.
  *
  * Commands are idempotent under redelivery: a NEW whose orderId has been seen
  * before is a no-op, as is a CANCEL for an unknown or already-gone order.
@@ -45,24 +51,31 @@ public final class OrderBook {
         this.symbol = symbol;
     }
 
-    public List<Fill> apply(OrderCommand command) {
+    /** Everything one command did to the book: the fills it produced plus a depth delta per touched price level. */
+    public record ApplyResult(List<Fill> fills, List<BookUpdate> bookUpdates) {
+
+        private static final ApplyResult EMPTY = new ApplyResult(List.of(), List.of());
+    }
+
+    public ApplyResult apply(OrderCommand command) {
         if (!symbol.equals(command.symbol())) {
             throw new IllegalArgumentException(
                     "command for " + command.symbol() + " routed to " + symbol + " book");
         }
         if (command.type() == CommandType.CANCEL) {
-            cancel(command.orderId());
-            return List.of();
+            return cancel(command.orderId(), command.timestampNanos());
         }
         if (!seenOrderIds.add(command.orderId())) {
-            return List.of();
+            return ApplyResult.EMPTY;
         }
         return match(command);
     }
 
-    private List<Fill> match(OrderCommand taker) {
+    private ApplyResult match(OrderCommand taker) {
         var fills = new ArrayList<Fill>();
         var opposite = taker.side() == Side.BUY ? asks : bids;
+        var oppositeSide = taker.side() == Side.BUY ? Side.SELL : Side.BUY;
+        var touchedOppositeTicks = new LinkedHashSet<Long>();
         long remaining = taker.quantity();
 
         while (remaining > 0 && !opposite.isEmpty() && crosses(taker.side(), taker.priceTicks(), opposite.firstKey())) {
@@ -80,6 +93,7 @@ public final class OrderBook {
                     traded,
                     taker.timestampNanos()));
 
+            touchedOppositeTicks.add(level.getKey());
             remaining -= traded;
             maker.remaining -= traded;
             if (maker.remaining == 0) {
@@ -91,22 +105,28 @@ public final class OrderBook {
             }
         }
 
+        var updates = new ArrayList<BookUpdate>();
+        for (long ticks : touchedOppositeTicks) {
+            updates.add(new BookUpdate(symbol, oppositeSide, ticks, depthAt(oppositeSide, ticks), taker.timestampNanos()));
+        }
         if (remaining > 0) {
             var resting = new RestingOrder(taker.orderId(), taker.userId(), taker.side(), taker.priceTicks(), remaining);
             sideOf(taker.side()).computeIfAbsent(taker.priceTicks(), p -> new ArrayDeque<>()).addLast(resting);
             byOrderId.put(taker.orderId(), resting);
+            updates.add(new BookUpdate(
+                    symbol, taker.side(), taker.priceTicks(), depthAt(taker.side(), taker.priceTicks()), taker.timestampNanos()));
         }
-        return fills;
+        return new ApplyResult(fills, updates);
     }
 
     private static boolean crosses(Side takerSide, long limitTicks, long bestOppositeTicks) {
         return takerSide == Side.BUY ? limitTicks >= bestOppositeTicks : limitTicks <= bestOppositeTicks;
     }
 
-    private void cancel(String orderId) {
+    private ApplyResult cancel(String orderId, long timestampNanos) {
         var order = byOrderId.remove(orderId);
         if (order == null) {
-            return;
+            return ApplyResult.EMPTY;
         }
         var levels = sideOf(order.side);
         var queue = levels.get(order.priceTicks);
@@ -114,6 +134,9 @@ public final class OrderBook {
         if (queue.isEmpty()) {
             levels.remove(order.priceTicks);
         }
+        return new ApplyResult(
+                List.of(),
+                List.of(new BookUpdate(symbol, order.side, order.priceTicks, depthAt(order.side, order.priceTicks), timestampNanos)));
     }
 
     private NavigableMap<Long, Deque<RestingOrder>> sideOf(Side side) {

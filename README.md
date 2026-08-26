@@ -31,8 +31,13 @@ Then open http://localhost:8090 and trade as the funded demo users `alice` and
 worst-case cost in TigerBeetle before they reach the log — an order you cannot
 afford is rejected by the ledger database itself with a 422. Ports/config via
 `KAFKA_BOOTSTRAP`, `TIGERBEETLE_ADDRESS` (3000), `GATEWAY_PORT` (8091),
-`MARKET_DATA_PORT` (8090), `GATEWAY_URL`, `ENGINE_SNAPSHOT_DIR`,
-`ENGINE_SNAPSHOT_EVERY`.
+`MARKET_DATA_PORT` (8090), `MARKET_DATA_WS_PORT` (8092), `GATEWAY_URL`,
+`ENGINE_SNAPSHOT_DIR`, `ENGINE_SNAPSHOT_EVERY`.
+
+The page rides the WebSocket feed (snapshot on connect, deltas after): the
+book, tape, and TigerBeetle balances update live, and a dropped or evicted
+connection self-heals by reconnecting for a fresh snapshot
+([ADR 0005](docs/adr/0005-fanout-backpressure.md)).
 
 ## Design
 

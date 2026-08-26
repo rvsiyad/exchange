@@ -5,6 +5,54 @@ what broke, what I'd say in an interview. Raw material — no polish needed.
 
 ---
 
+## 2026-08-26 · Session 5 — market-data fanout over WebSockets (PRs #23–#26)
+
+**What went in:** hand-rolled RFC 6455 WebSocket server + snapshot+delta feed
+(#23) → bounded per-client queues with slow-consumer eviction (#24) → the demo
+UI drops polling for the feed and gains a TigerBeetle balances panel (#25) →
+these docs (#26).
+
+**The one-sentence version:** fanout is where backpressure lives — every
+client gets a bounded queue drained by its own writer, and a client whose
+queue fills is evicted rather than allowed to stall the feed, which is safe
+only because snapshot+delta makes reconnecting self-healing.
+
+**What surprised / what broke:**
+
+- The JDK ships a WebSocket *client* but no server, and
+  `com.sun.net.httpserver` can't hand its socket over to an Upgrade — hence a
+  hand-rolled server on its own port. The whole protocol surface we needed
+  (handshake, text frames, close/ping) fit in ~250 lines, and the JDK client
+  in the tests meant an independent implementation validated our bytes.
+- Snapshot+delta has a one-line trap: an update sneaking between "snapshot
+  built" and "client registered" is lost forever. Snapshot and subscription
+  must be atomic under the projection lock. Real feeds solve the same gap with
+  sequence numbers because their snapshot and delta servers are different
+  machines.
+- We shipped the naive fanout on purpose in #23 (writes inline on the consumer
+  thread) and it hid a subtler bug than the obvious one: the *connect-time
+  snapshot* was also a blocking write under the lock, so a client slow from
+  its first byte could have stalled the projection. The queue fixed both for
+  the same price — hand-off never blocks, and the snapshot always fits because
+  the queue is empty at connect.
+- Breaking it on purpose was cheap: a raw socket that completes the handshake
+  and never reads another byte, with a small `SO_RCVBUF`. TCP absorbs the
+  first wave, the writer blocks, the queue fills, eviction fires — in
+  milliseconds, in a unit test, no containers.
+- Cross-topic order (`book-updates` vs `fills`) is not guaranteed — the WS test
+  must match messages by type, not position. Same lesson as session 3, new
+  costume: ordering is per-partition, and nothing else.
+- Live-demo quirk: port 8090 was squatted by the *other* project's gateway
+  binary; the page discovers the feed port from `/api/config` rather than
+  hard-coding it, which made moving ports a non-event.
+
+**Interview line:** "Bounded queue, then evict — never let one slow client
+exhaust server memory. Eviction is safe because the protocol is snapshot+delta:
+a reconnect heals everything. Drop-oldest would silently corrupt the client's
+book; conflation is the fancier answer and composes with the bound."
+
+---
+
 ## 2026-08-26 · Session 4 — money: TigerBeetle settlement (PRs #16–#22)
 
 **What went in:** asset registry + deterministic 128-bit ids (#16) → fills

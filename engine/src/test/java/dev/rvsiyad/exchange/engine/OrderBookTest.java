@@ -3,6 +3,7 @@ package dev.rvsiyad.exchange.engine;
 import dev.rvsiyad.exchange.common.BookUpdate;
 import dev.rvsiyad.exchange.common.Fill;
 import dev.rvsiyad.exchange.common.OrderCommand;
+import dev.rvsiyad.exchange.common.ReservationRelease;
 import dev.rvsiyad.exchange.common.Side;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -199,6 +200,28 @@ class OrderBookTest {
         sell("s1", "bob", 100_00, 2);
         cancel("nope", "mallory");
         assertEquals(100_00, book.bestAsk());
+    }
+
+    @Test
+    void cancelReleasesTheUnfilledReservation() {
+        sell("s1", "bob", 100_00, 5);
+        buy("b1", "alice", 100_00, 2);
+        var result = book.apply(OrderCommand.cancel("s1", "bob", "BTC-USD", 42L));
+
+        assertEquals(
+                List.of(new ReservationRelease("s1", "bob", "BTC-USD", Side.SELL, 100_00, 3, 42L)),
+                result.releases());
+    }
+
+    @Test
+    void onlyCancelsThatRemoveSomethingRelease() {
+        sell("s1", "bob", 100_00, 2);
+        buy("b1", "alice", 100_00, 2);   // s1 fully filled
+
+        assertTrue(book.apply(OrderCommand.cancel("s1", "bob", "BTC-USD", ++clock)).releases().isEmpty());
+        assertTrue(book.apply(OrderCommand.cancel("nope", "mallory", "BTC-USD", ++clock)).releases().isEmpty());
+        // A plain resting order emits no release either.
+        assertTrue(book.apply(OrderCommand.newOrder("b2", "carol", "BTC-USD", Side.BUY, 99_00, 1, ++clock)).releases().isEmpty());
     }
 
     @Test

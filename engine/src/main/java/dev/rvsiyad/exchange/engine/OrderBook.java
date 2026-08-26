@@ -4,6 +4,7 @@ import dev.rvsiyad.exchange.common.BookUpdate;
 import dev.rvsiyad.exchange.common.CommandType;
 import dev.rvsiyad.exchange.common.Fill;
 import dev.rvsiyad.exchange.common.OrderCommand;
+import dev.rvsiyad.exchange.common.ReservationRelease;
 import dev.rvsiyad.exchange.common.Side;
 
 import java.util.ArrayDeque;
@@ -51,10 +52,14 @@ public final class OrderBook {
         this.symbol = symbol;
     }
 
-    /** Everything one command did to the book: the fills it produced plus a depth delta per touched price level. */
-    public record ApplyResult(List<Fill> fills, List<BookUpdate> bookUpdates) {
+    /**
+     * Everything one command did to the book: the fills it produced, a depth
+     * delta per touched price level, and — for a cancel that removed a resting
+     * order — the reservation release settlement needs to void the funds hold.
+     */
+    public record ApplyResult(List<Fill> fills, List<BookUpdate> bookUpdates, List<ReservationRelease> releases) {
 
-        private static final ApplyResult EMPTY = new ApplyResult(List.of(), List.of());
+        private static final ApplyResult EMPTY = new ApplyResult(List.of(), List.of(), List.of());
     }
 
     public ApplyResult apply(OrderCommand command) {
@@ -119,7 +124,7 @@ public final class OrderBook {
             updates.add(new BookUpdate(
                     symbol, taker.side(), taker.priceTicks(), depthAt(taker.side(), taker.priceTicks()), taker.timestampNanos()));
         }
-        return new ApplyResult(fills, updates);
+        return new ApplyResult(fills, updates, List.of());
     }
 
     private static boolean crosses(Side takerSide, long limitTicks, long bestOppositeTicks) {
@@ -139,7 +144,9 @@ public final class OrderBook {
         }
         return new ApplyResult(
                 List.of(),
-                List.of(new BookUpdate(symbol, order.side, order.priceTicks, depthAt(order.side, order.priceTicks), timestampNanos)));
+                List.of(new BookUpdate(symbol, order.side, order.priceTicks, depthAt(order.side, order.priceTicks), timestampNanos)),
+                List.of(new ReservationRelease(
+                        order.orderId, order.userId, symbol, order.side, order.priceTicks, order.remaining, timestampNanos)));
     }
 
     private NavigableMap<Long, Deque<RestingOrder>> sideOf(Side side) {

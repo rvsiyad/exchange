@@ -24,5 +24,5 @@ public record Fill(
         long takerPriceTicks,
         long takerRemaining,
         long makerRemaining,
-        long timestampNanos) {
+        long timestampNanos) implements FillsTopicEvent {
 }

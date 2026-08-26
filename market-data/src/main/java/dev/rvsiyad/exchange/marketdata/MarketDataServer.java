@@ -4,6 +4,7 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import dev.rvsiyad.exchange.common.BookUpdate;
 import dev.rvsiyad.exchange.common.Fill;
+import dev.rvsiyad.exchange.common.FillsTopic;
 import dev.rvsiyad.exchange.common.Json;
 import dev.rvsiyad.exchange.common.Side;
 import dev.rvsiyad.exchange.common.Topics;
@@ -119,8 +120,10 @@ public final class MarketDataServer implements AutoCloseable {
                     synchronized (lock) {
                         if (record.topic().equals(Topics.BOOK_UPDATES)) {
                             applyBookUpdate(Json.fromBytes(record.value(), BookUpdate.class));
-                        } else {
-                            applyFill(Json.fromBytes(record.value(), Fill.class));
+                        } else if (FillsTopic.decode(record.value()) instanceof Fill fill) {
+                            // Reservation releases share the topic but are
+                            // settlement's business, not the tape's.
+                            applyFill(fill);
                         }
                     }
                 }

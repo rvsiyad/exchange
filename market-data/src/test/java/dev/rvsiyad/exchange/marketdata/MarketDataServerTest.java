@@ -77,7 +77,7 @@ class MarketDataServerTest {
             update(producer, new BookUpdate("BTC-USD", Side.BUY, 100_00, 3, 2));
             update(producer, new BookUpdate("BTC-USD", Side.SELL, 101_00, 2, 3));   // absolute qty: idempotent
             update(producer, new BookUpdate("BTC-USD", Side.BUY, 100_00, 0, 4));    // level gone
-            var fill = new Fill("BTC-USD-1", "BTC-USD", "b1", "s1", "alice", "bob", Side.BUY, 101_00, 3, 5);
+            var fill = new Fill("BTC-USD-1", "BTC-USD", "b1", "s1", "alice", "bob", Side.BUY, 101_00, 3, 101_00, 0, 0, 5);
             fill(producer, fill);
             fill(producer, fill);                                                   // engine replay: same fill id
         }

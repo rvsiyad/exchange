@@ -232,6 +232,22 @@ class OrderBookTest {
     }
 
     @Test
+    void fillsCarryTakerLimitAndBothRemainders() {
+        // Dave (limit $101) sweeps Bob's 2 @ $100.50 and eats into Carol's 5 @ $101.
+        sell("s1", "bob", 100_50, 2);
+        sell("s2", "carol", 101_00, 5);
+        var fills = buy("b1", "dave", 101_00, 4);
+
+        assertEquals(2, fills.size());
+        assertEquals(101_00, fills.get(0).takerPriceTicks());
+        assertEquals(2, fills.get(0).takerRemaining());      // dave: 4 - 2
+        assertEquals(0, fills.get(0).makerRemaining());      // bob is done
+        assertEquals(101_00, fills.get(1).takerPriceTicks());
+        assertEquals(0, fills.get(1).takerRemaining());      // dave is done
+        assertEquals(3, fills.get(1).makerRemaining());      // carol: 5 - 2
+    }
+
+    @Test
     void fillTimestampsComeFromTheTakerCommand() {
         sell("s1", "bob", 100_00, 2);
         var taker = OrderCommand.newOrder("b1", "alice", "BTC-USD", Side.BUY, 100_00, 2, 42_000L);

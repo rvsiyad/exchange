@@ -25,7 +25,7 @@ class JsonRoundTripTest {
 
     @Test
     void fillRoundTrips() {
-        var fill = new Fill("f-1", "BTC-USD", "o-1", "o-2", "alice", "bob", Side.BUY, 65_000_00, 3, 789L);
+        var fill = new Fill("f-1", "BTC-USD", "o-1", "o-2", "alice", "bob", Side.BUY, 65_000_00, 3, 65_500_00, 1, 0, 789L);
         assertEquals(fill, Json.fromBytes(Json.toBytes(fill), Fill.class));
     }
 

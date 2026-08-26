@@ -28,12 +28,20 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.net.http.WebSocket;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.Set;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -46,6 +54,7 @@ class MarketDataServerTest {
 
     static MarketDataServer marketData;
     static String baseUrl;
+    static String wsUrl;
     static HttpServer fakeGateway;
     static final AtomicReference<String> gatewayRequestBody = new AtomicReference<>();
     static final HttpClient http = HttpClient.newHttpClient();
@@ -61,8 +70,9 @@ class MarketDataServerTest {
         fakeGateway = startFakeGateway();
         marketData = new MarketDataServer(
                 bootstrap, URI.create("http://localhost:" + fakeGateway.getAddress().getPort()));
-        var server = marketData.start(0);
+        var server = marketData.start(0, 0);
         baseUrl = "http://localhost:" + server.getAddress().getPort();
+        wsUrl = "ws://localhost:" + marketData.webSocketPort();
     }
 
     @AfterAll
@@ -99,6 +109,42 @@ class MarketDataServerTest {
     }
 
     @Test
+    void streamsSnapshotThenDeltasOverTheWebSocket() throws Exception {
+        var messages = new LinkedBlockingQueue<String>();
+        // The JDK ships a WebSocket *client*; pointing it at our hand-rolled
+        // server means an independent implementation validates the handshake
+        // and framing, not just our own code round-tripping with itself.
+        var ws = http.newWebSocketBuilder()
+                .buildAsync(URI.create(wsUrl + "/ws?symbol=ETH-USD"), collectInto(messages))
+                .get(10, TimeUnit.SECONDS);
+        try {
+            var snapshot = Json.tree(take(messages).getBytes(StandardCharsets.UTF_8));
+            assertEquals("snapshot", snapshot.get("type").asText());
+            assertEquals("ETH-USD", snapshot.get("book").get("symbol").asText());
+            assertTrue(snapshot.get("book").get("bids").isEmpty(), "nothing traded on ETH-USD yet");
+
+            try (var producer = newProducer()) {
+                update(producer, new BookUpdate("ETH-USD", Side.BUY, 50_00, 7, 10));
+                fill(producer, new Fill("ETH-USD-1", "ETH-USD", "b9", "s9", "alice", "bob",
+                        Side.SELL, 50_00, 2, 50_00, 0, 0, 11));
+            }
+
+            // book-updates and fills are separate topics, so cross-topic
+            // arrival order is not guaranteed — match by type, not position.
+            var received = new HashMap<String, com.fasterxml.jackson.databind.JsonNode>();
+            for (var i = 0; i < 2; i++) {
+                var message = Json.tree(take(messages).getBytes(StandardCharsets.UTF_8));
+                received.put(message.get("type").asText(), message);
+            }
+            assertEquals(Set.of("book", "trade"), received.keySet());
+            assertEquals(7, received.get("book").get("update").get("newQuantity").asLong());
+            assertEquals(2, received.get("trade").get("trade").get("quantity").asLong());
+        } finally {
+            ws.abort();
+        }
+    }
+
+    @Test
     void proxiesOrderEntryToTheGateway() throws Exception {
         var body = "{\"userId\":\"alice\",\"symbol\":\"BTC-USD\",\"side\":\"BUY\",\"priceTicks\":10000,\"quantity\":1}";
         var response = http.send(
@@ -119,6 +165,30 @@ class MarketDataServerTest {
                 HttpResponse.BodyHandlers.ofString());
         assertEquals(200, response.statusCode());
         assertTrue(response.body().contains("Order ticket"));
+    }
+
+    private static String take(LinkedBlockingQueue<String> messages) throws InterruptedException {
+        var message = messages.poll(15, TimeUnit.SECONDS);
+        assertNotNull(message, "timed out waiting for a websocket message");
+        return message;
+    }
+
+    /** The JDK client delivers text in chunks; reassemble whole messages into the queue. */
+    private static WebSocket.Listener collectInto(LinkedBlockingQueue<String> messages) {
+        return new WebSocket.Listener() {
+            final StringBuilder partial = new StringBuilder();
+
+            @Override
+            public CompletionStage<?> onText(WebSocket ws, CharSequence data, boolean last) {
+                partial.append(data);
+                if (last) {
+                    messages.add(partial.toString());
+                    partial.setLength(0);
+                }
+                ws.request(1);
+                return null;
+            }
+        };
     }
 
     private static HttpServer startFakeGateway() throws IOException {

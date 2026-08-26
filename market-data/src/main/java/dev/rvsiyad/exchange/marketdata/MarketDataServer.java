@@ -23,6 +23,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -49,8 +50,13 @@ import java.util.TreeMap;
  *
  * Order entry is proxied to the gateway so the page stays same-origin — the
  * UI contract from the session-2.5 demo is unchanged while the guts behind it
- * are now the full gateway → Kafka → engine → Kafka pipeline. Polling becomes
- * a WebSocket push in session 5.
+ * are now the full gateway → Kafka → engine → Kafka pipeline.
+ *
+ * The live feed speaks snapshot+delta, the same protocol real market-data
+ * feeds use: on connect a client gets the full book for its symbol, then only
+ * changes. Snapshot and subscription happen atomically under the projection
+ * lock, so there is no gap where an update could slip between "snapshot built"
+ * and "client registered".
  */
 public final class MarketDataServer implements AutoCloseable {
 
@@ -67,6 +73,15 @@ public final class MarketDataServer implements AutoCloseable {
     record BookSnapshot(String symbol, List<Level> bids, List<Level> asks, List<Trade> trades) {
     }
 
+    record SnapshotMessage(String type, BookSnapshot book) {
+    }
+
+    record BookDeltaMessage(String type, BookUpdate update) {
+    }
+
+    record TradeMessage(String type, String symbol, Trade trade) {
+    }
+
     private static final class SymbolState {
         final NavigableMap<Long, Long> bids = new TreeMap<>(Comparator.reverseOrder());
         final NavigableMap<Long, Long> asks = new TreeMap<>();
@@ -79,31 +94,41 @@ public final class MarketDataServer implements AutoCloseable {
             .connectTimeout(Duration.ofSeconds(5))
             .build();
     private final Map<String, SymbolState> symbols = new HashMap<>();
+    private final Map<String, Set<WebSocketHub.Client>> subscribers = new HashMap<>();
     private final Set<String> seenFillIds = new HashSet<>();
     private final Object lock = new Object();
     private final KafkaConsumer<String, byte[]> consumer;
     private final Thread consumerThread;
+    private final WebSocketHub hub;
     private long tradeSequence;
     private volatile boolean running = true;
     private HttpServer server;
+    private int webSocketPort;
 
     public MarketDataServer(String bootstrapServers, URI gatewayUri) {
         this.bootstrapServers = bootstrapServers;
         this.gatewayUri = gatewayUri;
         this.consumer = new KafkaConsumer<>(consumerConfig());
         this.consumerThread = new Thread(this::consume, "market-data-consumer");
+        this.hub = new WebSocketHub(new FeedClients());
     }
 
-    public HttpServer start(int port) throws IOException {
+    public HttpServer start(int httpPort, int wsPort) throws IOException {
         consumerThread.start();
-        server = HttpServer.create(new InetSocketAddress(port), 0);
+        webSocketPort = hub.start(wsPort);
+        server = HttpServer.create(new InetSocketAddress(httpPort), 0);
         server.createContext("/", this::servePage);
         server.createContext("/api/book", this::serveBook);
         server.createContext("/api/orders", exchange -> proxyToGateway(exchange, "/api/orders"));
         server.createContext("/api/cancel", exchange -> proxyToGateway(exchange, "/api/cancel"));
         server.start();
-        log.info("market-data listening on port {}", server.getAddress().getPort());
+        log.info("market-data listening on port {} (websocket feed on {})",
+                server.getAddress().getPort(), webSocketPort);
         return server;
+    }
+
+    public int webSocketPort() {
+        return webSocketPort;
     }
 
     private void consume() {
@@ -119,11 +144,16 @@ public final class MarketDataServer implements AutoCloseable {
                 for (var record : consumer.poll(Duration.ofMillis(250))) {
                     synchronized (lock) {
                         if (record.topic().equals(Topics.BOOK_UPDATES)) {
-                            applyBookUpdate(Json.fromBytes(record.value(), BookUpdate.class));
+                            var update = Json.fromBytes(record.value(), BookUpdate.class);
+                            applyBookUpdate(update);
+                            broadcast(update.symbol(), new BookDeltaMessage("book", update));
                         } else if (FillsTopic.decode(record.value()) instanceof Fill fill) {
                             // Reservation releases share the topic but are
                             // settlement's business, not the tape's.
-                            applyFill(fill);
+                            var trade = applyFill(fill);
+                            if (trade != null) {
+                                broadcast(fill.symbol(), new TradeMessage("trade", fill.symbol(), trade));
+                            }
                         }
                     }
                 }
@@ -147,14 +177,43 @@ public final class MarketDataServer implements AutoCloseable {
         }
     }
 
-    private void applyFill(Fill fill) {
+    /** Returns the tape entry, or null when the fill was a redelivered duplicate. */
+    private Trade applyFill(Fill fill) {
         if (!seenFillIds.add(fill.fillId())) {
-            return;
+            return null;
         }
         var state = symbols.computeIfAbsent(fill.symbol(), s -> new SymbolState());
-        state.trades.addFirst(new Trade(fill.priceTicks(), fill.quantity(), fill.takerSide(), ++tradeSequence));
+        var trade = new Trade(fill.priceTicks(), fill.quantity(), fill.takerSide(), ++tradeSequence);
+        state.trades.addFirst(trade);
         while (state.trades.size() > MAX_RECENT_TRADES) {
             state.trades.removeLast();
+        }
+        return trade;
+    }
+
+    /**
+     * Caller holds the lock. Writes happen inline on the consumer thread, so
+     * one slow client stalls the whole feed — this is the naive fanout on
+     * purpose; bounded per-client queues with slow-consumer eviction land in
+     * the next PR.
+     */
+    private void broadcast(String symbol, Object message) {
+        var clients = subscribers.get(symbol);
+        if (clients == null || clients.isEmpty()) {
+            return;
+        }
+        var payload = new String(Json.toBytes(message), StandardCharsets.UTF_8);
+        var dead = new ArrayList<WebSocketHub.Client>();
+        for (var client : clients) {
+            try {
+                client.sendText(payload);
+            } catch (IOException e) {
+                dead.add(client);
+            }
+        }
+        for (var client : dead) {
+            clients.remove(client);
+            client.close();
         }
     }
 
@@ -176,14 +235,42 @@ public final class MarketDataServer implements AutoCloseable {
         }
         BookSnapshot snapshot;
         synchronized (lock) {
-            var state = symbols.getOrDefault(symbol, new SymbolState());
-            snapshot = new BookSnapshot(
-                    symbol,
-                    topLevels(state.bids),
-                    topLevels(state.asks),
-                    List.copyOf(state.trades));
+            snapshot = snapshotLocked(symbol);
         }
         respond(exchange, 200, Json.toBytes(snapshot), "application/json");
+    }
+
+    private BookSnapshot snapshotLocked(String symbol) {
+        var state = symbols.getOrDefault(symbol, new SymbolState());
+        return new BookSnapshot(
+                symbol,
+                topLevels(state.bids),
+                topLevels(state.asks),
+                List.copyOf(state.trades));
+    }
+
+    private final class FeedClients implements WebSocketHub.Listener {
+
+        @Override
+        public void clientConnected(WebSocketHub.Client client, String symbol) {
+            synchronized (lock) {
+                try {
+                    client.sendText(new String(
+                            Json.toBytes(new SnapshotMessage("snapshot", snapshotLocked(symbol))),
+                            StandardCharsets.UTF_8));
+                    subscribers.computeIfAbsent(symbol, s -> new HashSet<>()).add(client);
+                } catch (IOException e) {
+                    client.close();
+                }
+            }
+        }
+
+        @Override
+        public void clientDisconnected(WebSocketHub.Client client) {
+            synchronized (lock) {
+                subscribers.values().forEach(clients -> clients.remove(client));
+            }
+        }
     }
 
     private static List<Level> topLevels(NavigableMap<Long, Long> side) {
@@ -239,6 +326,11 @@ public final class MarketDataServer implements AutoCloseable {
     public void close() {
         if (server != null) {
             server.stop(0);
+        }
+        hub.close();
+        synchronized (lock) {
+            subscribers.values().forEach(clients -> clients.forEach(WebSocketHub.Client::close));
+            subscribers.clear();
         }
         running = false;
         consumer.wakeup();

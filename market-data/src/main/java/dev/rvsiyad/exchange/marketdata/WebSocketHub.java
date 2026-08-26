@@ -16,6 +16,8 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.Base64;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 
 /**
  * Minimal RFC 6455 WebSocket server: HTTP Upgrade handshake in, text frames
@@ -44,14 +46,26 @@ final class WebSocketHub implements AutoCloseable {
     private static final String HANDSHAKE_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     private static final int MAX_HANDSHAKE_BYTES = 8 * 1024;
     private static final long MAX_INBOUND_FRAME_BYTES = 1 << 20;
+    /**
+     * Outbound messages a client may have in flight before it is considered
+     * too slow to serve. Deep enough to ride out a GC pause or a wifi hiccup,
+     * shallow enough that a stuck client costs bounded memory.
+     */
+    static final int DEFAULT_QUEUE_CAPACITY = 256;
 
     private final Listener listener;
+    private final int queueCapacity;
     private ServerSocket serverSocket;
     private Thread acceptThread;
     private volatile boolean running = true;
 
     WebSocketHub(Listener listener) {
+        this(listener, DEFAULT_QUEUE_CAPACITY);
+    }
+
+    WebSocketHub(Listener listener, int queueCapacity) {
         this.listener = listener;
+        this.queueCapacity = queueCapacity;
     }
 
     /** Binds and starts accepting; returns the bound port (useful when asked for port 0). */
@@ -80,7 +94,7 @@ final class WebSocketHub implements AutoCloseable {
         try {
             var in = socket.getInputStream();
             var symbol = handshake(socket, in);
-            client = new Client(socket);
+            client = new Client(socket, queueCapacity);
             listener.clientConnected(client, symbol);
             readLoop(client, in);
         } catch (IOException e) {
@@ -250,19 +264,50 @@ final class WebSocketHub implements AutoCloseable {
         }
     }
 
-    /** One connected browser. Frame writes are serialized so broadcasts cannot interleave bytes. */
+    /**
+     * One connected browser, decoupled from the feed by a bounded queue and a
+     * dedicated writer thread. Producers hand off with {@link #enqueue} and
+     * never touch the socket, so a client on a bad link can only ever stall
+     * its own writer — when its queue fills, the client is evicted rather than
+     * allowed to hold anyone up. Eviction is safe by protocol design: a
+     * reconnecting client gets a fresh snapshot, so no state is lost for good.
+     */
     static final class Client {
 
         private final Socket socket;
         private final OutputStream out;
+        private final BlockingQueue<String> outbound;
+        private final Thread writer;
 
-        private Client(Socket socket) throws IOException {
+        private Client(Socket socket, int queueCapacity) throws IOException {
             this.socket = socket;
             this.out = new BufferedOutputStream(socket.getOutputStream());
+            this.outbound = new ArrayBlockingQueue<>(queueCapacity);
+            this.writer = Thread.ofVirtual().name("ws-writer-" + socket.getPort()).start(this::drainOutbound);
         }
 
-        void sendText(String message) throws IOException {
-            sendFrame(0x1, message.getBytes(StandardCharsets.UTF_8));
+        /**
+         * Non-blocking hand-off to the writer. Returns false when the queue
+         * was full — the client could not keep up and has been closed.
+         */
+        boolean enqueue(String message) {
+            if (outbound.offer(message)) {
+                return true;
+            }
+            close();
+            return false;
+        }
+
+        private void drainOutbound() {
+            try {
+                while (true) {
+                    sendFrame(0x1, outbound.take().getBytes(StandardCharsets.UTF_8));
+                }
+            } catch (InterruptedException e) {
+                // close() interrupted us: done
+            } catch (IOException e) {
+                close();
+            }
         }
 
         private synchronized void sendFrame(int opcode, byte[] payload) throws IOException {
@@ -284,6 +329,7 @@ final class WebSocketHub implements AutoCloseable {
         }
 
         void close() {
+            writer.interrupt();
             closeQuietly(socket);
         }
     }

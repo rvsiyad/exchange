@@ -192,10 +192,10 @@ public final class MarketDataServer implements AutoCloseable {
     }
 
     /**
-     * Caller holds the lock. Writes happen inline on the consumer thread, so
-     * one slow client stalls the whole feed — this is the naive fanout on
-     * purpose; bounded per-client queues with slow-consumer eviction land in
-     * the next PR.
+     * Caller holds the lock. Hand-off to each client's bounded queue never
+     * blocks, so the consumer thread's pace is independent of every client's
+     * link: a client whose queue is full has already been closed by enqueue —
+     * we just log the eviction and forget it.
      */
     private void broadcast(String symbol, Object message) {
         var clients = subscribers.get(symbol);
@@ -203,17 +203,15 @@ public final class MarketDataServer implements AutoCloseable {
             return;
         }
         var payload = new String(Json.toBytes(message), StandardCharsets.UTF_8);
-        var dead = new ArrayList<WebSocketHub.Client>();
+        var evicted = new ArrayList<WebSocketHub.Client>();
         for (var client : clients) {
-            try {
-                client.sendText(payload);
-            } catch (IOException e) {
-                dead.add(client);
+            if (!client.enqueue(payload)) {
+                evicted.add(client);
             }
         }
-        for (var client : dead) {
+        for (var client : evicted) {
             clients.remove(client);
-            client.close();
+            log.warn("evicted slow websocket consumer on {}: send queue full", symbol);
         }
     }
 
@@ -254,14 +252,13 @@ public final class MarketDataServer implements AutoCloseable {
         @Override
         public void clientConnected(WebSocketHub.Client client, String symbol) {
             synchronized (lock) {
-                try {
-                    client.sendText(new String(
-                            Json.toBytes(new SnapshotMessage("snapshot", snapshotLocked(symbol))),
-                            StandardCharsets.UTF_8));
-                    subscribers.computeIfAbsent(symbol, s -> new HashSet<>()).add(client);
-                } catch (IOException e) {
-                    client.close();
-                }
+                // The queue is empty at connect, so the snapshot always fits;
+                // enqueueing (rather than writing the socket here) keeps slow
+                // clients from ever stalling a thread that holds the lock.
+                client.enqueue(new String(
+                        Json.toBytes(new SnapshotMessage("snapshot", snapshotLocked(symbol))),
+                        StandardCharsets.UTF_8));
+                subscribers.computeIfAbsent(symbol, s -> new HashSet<>()).add(client);
             }
         }
 

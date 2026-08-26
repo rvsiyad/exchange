@@ -2,10 +2,12 @@ package dev.rvsiyad.exchange.gateway;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import dev.rvsiyad.exchange.common.Assets;
 import dev.rvsiyad.exchange.common.Json;
 import dev.rvsiyad.exchange.common.OrderCommand;
 import dev.rvsiyad.exchange.common.Side;
 import dev.rvsiyad.exchange.common.Topics;
+import dev.rvsiyad.exchange.ledger.Ledger;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
@@ -17,21 +19,31 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.time.Instant;
+import java.util.List;
 import java.util.Properties;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 /**
  * REST order entry. The gateway owns none of the matching: it validates,
- * assigns an order id, and publishes an OrderCommand to `orders` keyed by
- * symbol — the key is what routes every command for a symbol to the same
- * partition, and therefore to the same single-writer engine thread.
+ * reserves the order's worst-case cost in TigerBeetle, assigns an order id,
+ * and publishes an OrderCommand to `orders` keyed by symbol — the key is what
+ * routes every command for a symbol to the same partition, and therefore to
+ * the same single-writer engine thread.
+ *
+ * The reservation happens before the publish, so an order can only reach the
+ * book with its funds already held: insufficient funds is rejected by the
+ * ledger database itself (422), and the matching engine never needs to know
+ * money exists. A buy holds limit x quantity of the quote asset (worst case
+ * — price improvement is refunded at settlement); a sell holds the base
+ * quantity.
  *
  * Responses are 202: the order is durably in the log (acks=all before we
- * answer), but matching happens asynchronously downstream. Fund reservation
- * (TigerBeetle) and idempotency keys (Postgres) arrive in later sessions.
+ * answer), but matching happens asynchronously downstream.
  */
 public final class GatewayServer implements AutoCloseable {
 
@@ -47,10 +59,16 @@ public final class GatewayServer implements AutoCloseable {
     record AcceptedResponse(String orderId) {
     }
 
+    record BalancesResponse(String userId, List<Ledger.AssetBalance> balances) {
+    }
+
     private final KafkaProducer<String, byte[]> producer;
+    private final Ledger ledger;
+    private final Set<String> knownUsers = ConcurrentHashMap.newKeySet();
     private HttpServer server;
 
-    public GatewayServer(String bootstrapServers) {
+    public GatewayServer(String bootstrapServers, Ledger ledger) {
+        this.ledger = ledger;
         var config = new Properties();
         config.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
         config.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
@@ -65,6 +83,7 @@ public final class GatewayServer implements AutoCloseable {
         server.createContext("/health", exchange -> respond(exchange, 200, "ok".getBytes(), "text/plain"));
         server.createContext("/api/orders", this::placeOrder);
         server.createContext("/api/cancel", this::cancelOrder);
+        server.createContext("/api/balances", this::serveBalances);
         server.start();
         log.info("gateway listening on port {}", server.getAddress().getPort());
         return server;
@@ -88,14 +107,54 @@ public final class GatewayServer implements AutoCloseable {
                     "userId, symbol, side, positive priceTicks and quantity required".getBytes(), "text/plain");
             return;
         }
+        var instrument = Assets.parseSymbol(request.symbol()).orElse(null);
+        if (instrument == null) {
+            respond(exchange, 400, "unknown symbol".getBytes(), "text/plain");
+            return;
+        }
+
+        // Worst case the order can cost: a buy pays quote at its limit, a sell delivers base.
+        String reserveAsset;
+        long reserveAmount;
+        if (request.side() == Side.BUY) {
+            reserveAsset = instrument.quote();
+            try {
+                reserveAmount = Math.multiplyExact(request.priceTicks(), request.quantity());
+            } catch (ArithmeticException e) {
+                respond(exchange, 400, "order cost overflows".getBytes(), "text/plain");
+                return;
+            }
+        } else {
+            reserveAsset = instrument.base();
+            reserveAmount = request.quantity();
+        }
 
         var orderId = "o-" + UUID.randomUUID();
+        if (knownUsers.add(request.userId())) {
+            ledger.ensureUserAccounts(request.userId());
+        }
+        switch (ledger.reserve(orderId, request.userId(), reserveAsset, reserveAmount)) {
+            case INSUFFICIENT_FUNDS -> {
+                respond(exchange, 422, "insufficient funds".getBytes(), "text/plain");
+                return;
+            }
+            case FAILED -> {
+                respond(exchange, 503, "ledger unavailable".getBytes(), "text/plain");
+                return;
+            }
+            case RESERVED -> {
+            }
+        }
+
         var command = OrderCommand.newOrder(
                 orderId, request.userId(), request.symbol(), request.side(),
                 request.priceTicks(), request.quantity(), epochNanos());
         if (publish(command)) {
             respond(exchange, 202, Json.toBytes(new AcceptedResponse(orderId)), "application/json");
         } else {
+            // The order never reached the log, so nothing downstream will ever
+            // settle or void it — release the hold before failing the request.
+            ledger.voidReservation(orderId, 0);
             respond(exchange, 503, "order log unavailable".getBytes(), "text/plain");
         }
     }
@@ -117,12 +176,29 @@ public final class GatewayServer implements AutoCloseable {
             return;
         }
 
+        // No ledger work here: only the engine knows whether the cancel removes
+        // anything, and settlement voids the reservation when it says so.
         var command = OrderCommand.cancel(request.orderId(), request.userId(), request.symbol(), epochNanos());
         if (publish(command)) {
             respond(exchange, 202, Json.toBytes(new AcceptedResponse(request.orderId())), "application/json");
         } else {
             respond(exchange, 503, "order log unavailable".getBytes(), "text/plain");
         }
+    }
+
+    private void serveBalances(HttpExchange exchange) throws IOException {
+        if (!exchange.getRequestMethod().equals("GET")) {
+            respond(exchange, 405, "GET only".getBytes(), "text/plain");
+            return;
+        }
+        var query = exchange.getRequestURI().getQuery();
+        if (query == null || !query.startsWith("userId=") || query.substring(7).isBlank()) {
+            respond(exchange, 400, "userId required".getBytes(), "text/plain");
+            return;
+        }
+        var userId = query.substring(7);
+        respond(exchange, 200,
+                Json.toBytes(new BalancesResponse(userId, ledger.balances(userId))), "application/json");
     }
 
     /** Blocks until the broker acknowledges the write: a 202 means the command is durably in the log. */
@@ -163,5 +239,6 @@ public final class GatewayServer implements AutoCloseable {
             server.stop(0);
         }
         producer.close();
+        ledger.close();
     }
 }

@@ -21,6 +21,18 @@
       <version>${project.version}</version>
     </dependency>
     <dependency>
+      <groupId>dev.rvsiyad.exchange</groupId>
+      <artifactId>ledger</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>dev.rvsiyad.exchange</groupId>
+      <artifactId>ledger</artifactId>
+      <version>${project.version}</version>
+      <type>test-jar</type>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
       <groupId>org.apache.kafka</groupId>
       <artifactId>kafka-clients</artifactId>
     </dependency>

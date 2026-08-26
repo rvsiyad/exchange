@@ -17,6 +17,9 @@ import org.apache.kafka.common.serialization.StringDeserializer;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import dev.rvsiyad.exchange.ledger.Ledger;
+import dev.rvsiyad.exchange.ledger.TigerBeetleContainers;
+import org.testcontainers.containers.GenericContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import org.testcontainers.redpanda.RedpandaContainer;
@@ -42,6 +45,9 @@ class GatewayServerTest {
     @Container
     static final RedpandaContainer REDPANDA = new RedpandaContainer("redpandadata/redpanda:v24.2.7");
 
+    @Container
+    static final GenericContainer<?> TIGERBEETLE = TigerBeetleContainers.create();
+
     static GatewayServer gateway;
     static String baseUrl;
     static final HttpClient http = HttpClient.newHttpClient();
@@ -52,7 +58,14 @@ class GatewayServerTest {
         try (var admin = AdminClient.create(Map.of(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap))) {
             admin.createTopics(List.of(new NewTopic(Topics.ORDERS, 2, (short) 1))).all().get();
         }
-        gateway = new GatewayServer(bootstrap);
+        var ledger = new Ledger(TigerBeetleContainers.address(TIGERBEETLE));
+        ledger.ensureVenueAccounts();
+        for (var user : new String[]{"alice", "seller-sam"}) {
+            ledger.ensureUserAccounts(user);
+        }
+        ledger.fund("alice", "USD", 1_000_000_00);
+        ledger.fund("seller-sam", "ETH", 50);
+        gateway = new GatewayServer(bootstrap, ledger);
         var server = gateway.start(0);
         baseUrl = "http://localhost:" + server.getAddress().getPort();
     }
@@ -90,6 +103,61 @@ class GatewayServerTest {
         assertEquals(202, response.statusCode());
         var record = awaitOrderRecord(cmd -> cmd.type() == CommandType.CANCEL && cmd.orderId().equals("o-123"));
         assertEquals("SOL-USD", record.key());
+    }
+
+    @Test
+    void acceptedBuyHoldsItsWorstCaseQuoteCost() throws Exception {
+        var response = post("/api/orders",
+                "{\"userId\":\"alice\",\"symbol\":\"BTC-USD\",\"side\":\"BUY\",\"priceTicks\":5000000,\"quantity\":2}");
+        assertEquals(202, response.statusCode());
+
+        // The hold is visible before any matching happened: reservation precedes publish.
+        assertEquals(2 * 5000000, balance("alice", "USD").reserved());
+        assertEquals(1_000_000_00, balance("alice", "USD").total());
+    }
+
+    @Test
+    void acceptedSellHoldsTheBaseQuantity() throws Exception {
+        var response = post("/api/orders",
+                "{\"userId\":\"seller-sam\",\"symbol\":\"ETH-USD\",\"side\":\"SELL\",\"priceTicks\":200000,\"quantity\":7}");
+        assertEquals(202, response.statusCode());
+        assertEquals(7, balance("seller-sam", "ETH").reserved());
+        assertEquals(50, balance("seller-sam", "ETH").total());
+    }
+
+    @Test
+    void theLedgerRejectsOrdersTheUserCannotAfford() throws Exception {
+        // mallory has accounts auto-created on first contact, but no money.
+        var response = post("/api/orders",
+                "{\"userId\":\"mallory\",\"symbol\":\"ETH-USD\",\"side\":\"BUY\",\"priceTicks\":200000,\"quantity\":1}");
+        assertEquals(422, response.statusCode());
+        assertEquals(0, balance("mallory", "USD").reserved());
+    }
+
+    @Test
+    void unknownSymbolsNeverReachLedgerOrLog() throws Exception {
+        assertEquals(400, post("/api/orders",
+                "{\"userId\":\"alice\",\"symbol\":\"DOGE-USD\",\"side\":\"BUY\",\"priceTicks\":1,\"quantity\":1}")
+                .statusCode());
+    }
+
+    @Test
+    void balancesEndpointRequiresAUser() throws Exception {
+        assertEquals(400, http.send(
+                HttpRequest.newBuilder(URI.create(baseUrl + "/api/balances")).GET().build(),
+                HttpResponse.BodyHandlers.ofString()).statusCode());
+    }
+
+    private static Ledger.AssetBalance balance(String userId, String asset) throws Exception {
+        var response = http.send(
+                HttpRequest.newBuilder(URI.create(baseUrl + "/api/balances?userId=" + userId)).GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, response.statusCode());
+        var balances = Json.fromBytes(response.body().getBytes(), GatewayServer.BalancesResponse.class);
+        return balances.balances().stream()
+                .filter(b -> b.asset().equals(asset))
+                .findFirst()
+                .orElseThrow();
     }
 
     @Test

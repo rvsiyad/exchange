@@ -1,6 +1,7 @@
 package dev.rvsiyad.exchange.common;
 
 import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
@@ -34,6 +35,14 @@ public final class Json {
     public static <T> T fromBytes(byte[] bytes, Class<T> type) {
         try {
             return MAPPER.readValue(bytes, type);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    public static JsonNode tree(byte[] bytes) {
+        try {
+            return MAPPER.readTree(bytes);
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }

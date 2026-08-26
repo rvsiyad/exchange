@@ -178,6 +178,11 @@ public final class Engine implements AutoCloseable {
                 for (var fill : result.fills()) {
                     producer.send(new ProducerRecord<>(Topics.FILLS, fill.symbol(), Json.toBytes(fill)));
                 }
+                // Releases share the fills topic and key so settlement sees fills
+                // and voids for a symbol in the order the engine decided them.
+                for (var release : result.releases()) {
+                    producer.send(new ProducerRecord<>(Topics.FILLS, release.symbol(), Json.toBytes(release)));
+                }
                 for (var update : result.bookUpdates()) {
                     producer.send(new ProducerRecord<>(Topics.BOOK_UPDATES, update.symbol(), Json.toBytes(update)));
                 }

@@ -4,6 +4,7 @@ import com.sun.net.httpserver.HttpServer;
 import dev.rvsiyad.exchange.common.BookUpdate;
 import dev.rvsiyad.exchange.common.Fill;
 import dev.rvsiyad.exchange.common.Json;
+import dev.rvsiyad.exchange.common.ReservationRelease;
 import dev.rvsiyad.exchange.common.Side;
 import dev.rvsiyad.exchange.common.Topics;
 import org.apache.kafka.clients.admin.AdminClient;
@@ -80,6 +81,9 @@ class MarketDataServerTest {
             var fill = new Fill("BTC-USD-1", "BTC-USD", "b1", "s1", "alice", "bob", Side.BUY, 101_00, 3, 101_00, 0, 0, 5);
             fill(producer, fill);
             fill(producer, fill);                                                   // engine replay: same fill id
+            // A cancel's reservation release shares the topic; it must never hit the tape.
+            producer.send(new ProducerRecord<>(Topics.FILLS, "BTC-USD",
+                    Json.toBytes(new ReservationRelease("s2", "carol", "BTC-USD", Side.SELL, 102_00, 4, 6))));
         }
 
         awaitBook(s -> !s.trades().isEmpty() && s.bids().isEmpty()

@@ -57,6 +57,7 @@ class MarketDataServerTest {
     static String wsUrl;
     static HttpServer fakeGateway;
     static final AtomicReference<String> gatewayRequestBody = new AtomicReference<>();
+    static final AtomicReference<String> gatewayBalancesQuery = new AtomicReference<>();
     static final HttpClient http = HttpClient.newHttpClient();
 
     @BeforeAll
@@ -165,6 +166,27 @@ class MarketDataServerTest {
                 HttpResponse.BodyHandlers.ofString());
         assertEquals(200, response.statusCode());
         assertTrue(response.body().contains("Order ticket"));
+        assertTrue(response.body().contains("Balances"));
+    }
+
+    @Test
+    void servesTheWebSocketPortAsConfig() throws Exception {
+        var response = http.send(
+                HttpRequest.newBuilder(URI.create(baseUrl + "/api/config")).GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, response.statusCode());
+        assertEquals(marketData.webSocketPort(),
+                Json.tree(response.body().getBytes(StandardCharsets.UTF_8)).get("webSocketPort").asInt());
+    }
+
+    @Test
+    void proxiesBalancesToTheGatewayWithTheQueryString() throws Exception {
+        var response = http.send(
+                HttpRequest.newBuilder(URI.create(baseUrl + "/api/balances?userId=alice")).GET().build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, response.statusCode());
+        assertTrue(response.body().contains("USD"));
+        assertEquals("userId=alice", gatewayBalancesQuery.get(), "query string must reach the gateway");
     }
 
     private static String take(LinkedBlockingQueue<String> messages) throws InterruptedException {
@@ -198,6 +220,16 @@ class MarketDataServerTest {
             var out = "{\"orderId\":\"o-fake\"}".getBytes();
             exchange.getResponseHeaders().set("Content-Type", "application/json");
             exchange.sendResponseHeaders(202, out.length);
+            try (var os = exchange.getResponseBody()) {
+                os.write(out);
+            }
+        });
+        server.createContext("/api/balances", exchange -> {
+            gatewayBalancesQuery.set(exchange.getRequestURI().getRawQuery());
+            var out = "{\"userId\":\"alice\",\"balances\":[{\"asset\":\"USD\",\"total\":100,\"reserved\":0,\"available\":100}]}"
+                    .getBytes();
+            exchange.getResponseHeaders().set("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, out.length);
             try (var os = exchange.getResponseBody()) {
                 os.write(out);
             }

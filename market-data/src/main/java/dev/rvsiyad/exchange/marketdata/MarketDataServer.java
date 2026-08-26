@@ -82,6 +82,9 @@ public final class MarketDataServer implements AutoCloseable {
     record TradeMessage(String type, String symbol, Trade trade) {
     }
 
+    record ConfigResponse(int webSocketPort) {
+    }
+
     private static final class SymbolState {
         final NavigableMap<Long, Long> bids = new TreeMap<>(Comparator.reverseOrder());
         final NavigableMap<Long, Long> asks = new TreeMap<>();
@@ -119,8 +122,11 @@ public final class MarketDataServer implements AutoCloseable {
         server = HttpServer.create(new InetSocketAddress(httpPort), 0);
         server.createContext("/", this::servePage);
         server.createContext("/api/book", this::serveBook);
+        server.createContext("/api/config", this::serveConfig);
         server.createContext("/api/orders", exchange -> proxyToGateway(exchange, "/api/orders"));
         server.createContext("/api/cancel", exchange -> proxyToGateway(exchange, "/api/cancel"));
+        server.createContext("/api/balances",
+                exchange -> proxyToGateway(exchange, pathWithQuery(exchange, "/api/balances")));
         server.start();
         log.info("market-data listening on port {} (websocket feed on {})",
                 server.getAddress().getPort(), webSocketPort);
@@ -223,6 +229,16 @@ public final class MarketDataServer implements AutoCloseable {
         try (var page = MarketDataServer.class.getResourceAsStream("/web/index.html")) {
             respond(exchange, 200, page.readAllBytes(), "text/html");
         }
+    }
+
+    /** The page discovers the feed's port here instead of hard-coding it. */
+    private void serveConfig(HttpExchange exchange) throws IOException {
+        respond(exchange, 200, Json.toBytes(new ConfigResponse(webSocketPort)), "application/json");
+    }
+
+    private static String pathWithQuery(HttpExchange exchange, String path) {
+        var query = exchange.getRequestURI().getRawQuery();
+        return query == null ? path : path + "?" + query;
     }
 
     private void serveBook(HttpExchange exchange) throws IOException {

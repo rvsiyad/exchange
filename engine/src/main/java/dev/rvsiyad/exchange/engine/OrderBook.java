@@ -82,6 +82,8 @@ public final class OrderBook {
             var level = opposite.firstEntry();
             var maker = level.getValue().peekFirst();
             long traded = Math.min(remaining, maker.remaining);
+            remaining -= traded;
+            maker.remaining -= traded;
 
             fills.add(new Fill(
                     symbol + "-" + ++fillSequence,
@@ -91,11 +93,12 @@ public final class OrderBook {
                     taker.side(),
                     level.getKey(),
                     traded,
+                    taker.priceTicks(),
+                    remaining,
+                    maker.remaining,
                     taker.timestampNanos()));
 
             touchedOppositeTicks.add(level.getKey());
-            remaining -= traded;
-            maker.remaining -= traded;
             if (maker.remaining == 0) {
                 level.getValue().pollFirst();
                 byOrderId.remove(maker.orderId);

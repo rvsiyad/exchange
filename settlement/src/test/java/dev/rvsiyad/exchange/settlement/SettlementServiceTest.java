@@ -2,6 +2,7 @@ package dev.rvsiyad.exchange.settlement;
 
 import dev.rvsiyad.exchange.common.Fill;
 import dev.rvsiyad.exchange.common.Json;
+import dev.rvsiyad.exchange.common.Metrics;
 import dev.rvsiyad.exchange.common.ReservationRelease;
 import dev.rvsiyad.exchange.common.Side;
 import dev.rvsiyad.exchange.common.Topics;
@@ -113,12 +114,19 @@ class SettlementServiceTest {
     @Test
     @Order(2)
     void aRedeliveredFillChangesNothing() throws Exception {
+        long settledBefore = Metrics.counter("settlement_fills_settled_total", "").value();
+        long duplicatesBefore = Metrics.counter("settlement_duplicates_total", "").value();
+
         publish(new Fill("ETH-USD-1", "ETH-USD", "b1", "s1", "alice", "bob",
                 Side.BUY, 20_00, 2, 21_00, 0, 3, 1L));
         Thread.sleep(1_000);   // give the duplicate time to arrive and be dropped
         assertEquals(new Ledger.AssetBalance("USD", ALICE_USD - 40_00, 0, ALICE_USD - 40_00),
                 ledger.balance("alice", "USD"));
         assertEquals(new Ledger.AssetBalance("ETH", BOB_ETH - 2, 3, BOB_ETH - 5), ledger.balance("bob", "ETH"));
+
+        // The metrics saw a duplicate, not a settlement.
+        assertEquals(settledBefore, Metrics.counter("settlement_fills_settled_total", "").value());
+        assertEquals(duplicatesBefore + 1, Metrics.counter("settlement_duplicates_total", "").value());
     }
 
     @Test

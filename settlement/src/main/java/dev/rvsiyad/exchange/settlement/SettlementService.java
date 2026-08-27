@@ -2,6 +2,7 @@ package dev.rvsiyad.exchange.settlement;
 
 import dev.rvsiyad.exchange.common.Fill;
 import dev.rvsiyad.exchange.common.FillsTopic;
+import dev.rvsiyad.exchange.common.Metrics;
 import dev.rvsiyad.exchange.common.ReservationRelease;
 import dev.rvsiyad.exchange.common.Topics;
 import dev.rvsiyad.exchange.ledger.Ledger;
@@ -43,6 +44,20 @@ import java.util.Set;
 public final class SettlementService implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(SettlementService.class);
+
+    // The money loop's health in three numbers: how much is settling, how much
+    // arrives twice (replay working as designed — nonzero is normal after a
+    // restart), and how far behind the engine's clock settlement is running.
+    private static final Metrics.Counter FILLS_SETTLED = Metrics.counter(
+            "settlement_fills_settled_total", "Fills whose linked transfer chain was applied");
+    private static final Metrics.Counter DUPLICATES = Metrics.counter(
+            "settlement_duplicates_total", "Redelivered fills dropped by the idempotency layer");
+    private static final Metrics.Counter RELEASES_VOIDED = Metrics.counter(
+            "settlement_releases_voided_total", "Cancel releases whose reservation was voided");
+    private static final Metrics.Counter FAILURES = Metrics.counter(
+            "settlement_failures_total", "Fills or releases the ledger refused");
+    private static final Metrics.Gauge LAG_SECONDS = Metrics.gauge(
+            "settlement_lag_seconds", "Age of the last settled fill: now minus its match timestamp");
 
     private final Ledger ledger;
     private final KafkaConsumer<String, byte[]> consumer;
@@ -106,6 +121,7 @@ public final class SettlementService implements AutoCloseable {
         // starts with an empty set and rebuilds by replaying each fill once.
         if (settledFillIds.contains(fill.fillId())) {
             log.debug("fill {} already processed (duplicate delivery)", fill.fillId());
+            DUPLICATES.increment();
             return;
         }
         var legs = TradeLegs.of(fill);
@@ -113,15 +129,25 @@ public final class SettlementService implements AutoCloseable {
         long sellerGeneration = generations.getOrDefault(legs.sellOrderId(), 0L);
         var result = ledger.settleFill(fill, buyerGeneration, sellerGeneration);
         switch (result) {
-            case SETTLED -> log.info("settled {}: {} {} @ {} ({} -> {})",
-                    fill.fillId(), fill.quantity(), legs.base(), fill.priceTicks(),
-                    legs.sellerUserId(), legs.buyerUserId());
-            case ALREADY_SETTLED -> log.debug("fill {} already settled (replay)", fill.fillId());
+            case SETTLED -> {
+                FILLS_SETTLED.increment();
+                LAG_SECONDS.set((nowNanos() - fill.timestampNanos()) / 1_000_000_000.0);
+                log.info("settled {}: {} {} @ {} ({} -> {})",
+                        fill.fillId(), fill.quantity(), legs.base(), fill.priceTicks(),
+                        legs.sellerUserId(), legs.buyerUserId());
+            }
+            case ALREADY_SETTLED -> {
+                // A replay caught by the ledger's deterministic ids instead of
+                // this projection (fresh process, old stream) — still a duplicate.
+                DUPLICATES.increment();
+                log.debug("fill {} already settled (replay)", fill.fillId());
+            }
             case FAILED -> {
                 // Typically an order that never passed through the gateway, so no
                 // reservation exists. The generation must not advance on a chain
                 // that never ran.
                 log.error("fill {} could not be settled; leaving generations untouched", fill.fillId());
+                FAILURES.increment();
                 return;
             }
         }
@@ -142,11 +168,17 @@ public final class SettlementService implements AutoCloseable {
         long generation = generations.getOrDefault(release.orderId(), 0L);
         var result = ledger.voidReservation(release.orderId(), generation);
         switch (result) {
-            case VOIDED -> log.info("voided reservation for cancelled order {} (generation {})",
-                    release.orderId(), generation);
+            case VOIDED -> {
+                RELEASES_VOIDED.increment();
+                log.info("voided reservation for cancelled order {} (generation {})",
+                        release.orderId(), generation);
+            }
             case ALREADY_RELEASED -> log.debug("reservation for {} already released", release.orderId());
-            case FAILED -> log.error("voiding reservation for {} (generation {}) failed",
-                    release.orderId(), generation);
+            case FAILED -> {
+                FAILURES.increment();
+                log.error("voiding reservation for {} (generation {}) failed",
+                        release.orderId(), generation);
+            }
         }
         generations.remove(release.orderId());
     }
@@ -154,6 +186,11 @@ public final class SettlementService implements AutoCloseable {
     /** Test hook: the projected generation of an order's reservation chain. */
     long generationOf(String orderId) {
         return generations.getOrDefault(orderId, 0L);
+    }
+
+    private static long nowNanos() {
+        var now = java.time.Instant.now();
+        return now.getEpochSecond() * 1_000_000_000L + now.getNano();
     }
 
     @Override

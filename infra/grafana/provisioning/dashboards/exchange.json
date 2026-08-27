@@ -1,0 +1,133 @@
+{
+  "uid": "exchange",
+  "title": "Exchange",
+  "tags": ["exchange"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Orders accepted /s",
+      "description": "Orders with funds reserved and durably in the log.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "rate(gateway_orders_accepted_total[1m])",
+          "legendFormat": "accepted",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Fills /s",
+      "description": "Fills emitted by matching, summed across engine partitions.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "sum(rate(engine_fills_total[1m]))",
+          "legendFormat": "fills",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Settlement lag",
+      "description": "Now minus the last settled fill's match timestamp: how far money runs behind matching.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "settlement_lag_seconds",
+          "legendFormat": "lag",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Engine commands /s by partition",
+      "description": "The ADR 0001 tradeoff made visible: a hot symbol is one series running away from the others.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "rate(engine_commands_total[1m])",
+          "legendFormat": "partition {{partition}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Orders rejected /s by reason",
+      "description": "Every pre-log rejection, labeled. insufficient_funds is the ledger saying no.",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "sum by (reason) (rate(gateway_orders_rejected_total[1m]))",
+          "legendFormat": "{{reason}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Feed clients",
+      "description": "WebSocket clients currently subscribed.",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "marketdata_clients",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Slow consumers evicted",
+      "description": "Bounded-queue evictions (ADR 0005). Climbing at idle is a bug.",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(marketdata_evictions_total)",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Duplicates dropped",
+      "description": "Redeliveries absorbed by the idempotency layers — nonzero after a restart is the design working.",
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 12 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(settlement_duplicates_total)",
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}

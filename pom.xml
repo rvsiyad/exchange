@@ -19,6 +19,7 @@
     <module>engine</module>
     <module>settlement</module>
     <module>market-data</module>
+    <module>storm</module>
   </modules>
 
   <properties>

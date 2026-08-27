@@ -5,6 +5,78 @@ what broke, what I'd say in an interview. Raw material — no polish needed.
 
 ---
 
+## 2026-08-27 · Session 6 — proving correctness: the order storm (PRs #27–#36)
+
+**What went in:** hand-rolled Prometheus registry + `/metrics` per service
+(#27) → gateway RED metrics (#28) → engine per-partition counters (#29) →
+settlement lag + duplicate counters (#30) → market-data fanout metrics (#31)
+→ provisioned Grafana dashboard (#32) → ledger invariant read APIs (#33) →
+gateway on virtual threads (#34) → **the order storm** (#35) → these docs
+(#36).
+
+**The one-sentence version:** the difference between "it works when I click
+around" and "I can prove properties under concurrency" is a test that doesn't
+know what the right balances *are* — only what must be true of them no matter
+how 800 randomized concurrent orders interleaved.
+
+**What surprised / what broke:**
+
+- The storm found its first bug **before it ever ran**: the JDK `HttpServer`
+  runs every handler on one dispatcher thread unless you set an executor, so
+  the "concurrent" gateway had been serial since session 3 and every test
+  passed anyway. A storm against it would have quietly measured nothing.
+  Fixing it (virtual thread per request) immediately exposed bug two: the
+  `knownUsers.add()` first-contact check marked a user known *before* their
+  accounts existed, so a concurrent second request could reserve against
+  missing accounts. Impossible while serial, inevitable once concurrent —
+  concurrency bugs hide behind accidental serialization.
+- The invariants wrote themselves once I asked "what would an auditor query?"
+  Conservation fell out of double-entry: `treasuryIssued == Σ user totals +
+  escrowPosted`, and a caught-up system has `escrowPosted == 0` because every
+  settlement chain routes money *through* escrow but nets it out. The
+  strongest check turned out to be cross-layer: holds implied by the engine's
+  final snapshots must equal the ledger's pending reservations to the cent —
+  two systems that never talk to each other agreeing about money.
+- Seed reproducibility has a precise boundary worth stating in an interview:
+  the *scenario* is a pure function of the seed, the *interleaving* is
+  deliberately not. Every green run is a new interleaving tried against the
+  same invariants; a red run replays the same orders with `-Dstorm.seed=`.
+- Quiescence — "the system is done" — is genuinely hard in an async pipeline,
+  and metrics solved it: `engine_commands_total` must reach the published
+  count, then `settlement_events_total` must reach the fills-stream record
+  count. Observability doing test-infrastructure work, which is also the
+  argument for counting *events* (duplicates included), not just outcomes.
+- Hand-rolling the Prometheus registry (~150 lines: counters, gauges, labels,
+  text exposition) taught more than a client library would have: a scrape is
+  just `name{labels} value` over HTTP, `rate()` turns monotonic counters into
+  the orders/s panel, and the partition label on `engine_commands_total` makes
+  the ADR-0001 hot-symbol tradeoff *visible* instead of theoretical.
+
+**Interview lines earned this session:**
+
+- "I storm the venue with randomized concurrent orders and assert conservation
+  of money, exactly-once settlement, and book-ledger agreement — properties,
+  not examples."
+- "The storm's first catch was architectural: the gateway had been accidentally
+  serial, and making it concurrent exposed a first-contact race the serial
+  version could never hit."
+- "Failures reproduce from a seed; interleavings don't, on purpose — every CI
+  run is a fresh interleaving against the same invariants."
+
+**Check-yourself questions for the teach-back:**
+
+1. Why is `escrowPosted == 0` the right post-storm assertion rather than
+   `escrowPosted == Σ open holds`? Where do open holds actually live?
+2. The book↔ledger check compares engine snapshots against pending
+   reservations. Walk the partial-fill case: why does generation n+1's amount
+   equal limit × remaining exactly?
+3. Why does the knownUsers race not corrupt money — what layer catches it,
+   and what does the user see instead?
+4. What would break if the storm asserted quiescence with a fixed sleep
+   instead of the metrics counters?
+
+---
+
 ## 2026-08-26 · Session 5 — market-data fanout over WebSockets (PRs #23–#26)
 
 **What went in:** hand-rolled RFC 6455 WebSocket server + snapshot+delta feed

@@ -1,6 +1,7 @@
 package dev.rvsiyad.exchange.engine;
 
 import dev.rvsiyad.exchange.common.Json;
+import dev.rvsiyad.exchange.common.Metrics;
 import dev.rvsiyad.exchange.common.OrderCommand;
 import dev.rvsiyad.exchange.common.Topics;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
@@ -128,11 +129,25 @@ public final class Engine implements AutoCloseable {
         private int commandsSinceSnapshot;
         private volatile boolean running = true;
 
+        // Labeled by partition so the dashboard shows skew directly: a hot
+        // symbol is one series running away from the others (the ADR 0001
+        // tradeoff, visible instead of theoretical).
+        private final Metrics.Counter commandsApplied;
+        private final Metrics.Counter fillsEmitted;
+        private final Metrics.Counter snapshotsWritten;
+
         Worker(int partition) {
             this.partition = new TopicPartition(Topics.ORDERS, partition);
             this.snapshotPath = snapshotDir.resolve(Topics.ORDERS + "-" + partition + ".json");
             this.consumer = new KafkaConsumer<>(consumerConfig());
             this.producer = new KafkaProducer<>(producerConfig());
+            var label = String.valueOf(partition);
+            this.commandsApplied = Metrics.counter(
+                    "engine_commands_total", "Order commands applied to a book, by partition", "partition", label);
+            this.fillsEmitted = Metrics.counter(
+                    "engine_fills_total", "Fills emitted by matching, by partition", "partition", label);
+            this.snapshotsWritten = Metrics.counter(
+                    "engine_snapshots_total", "Book snapshots written, by partition", "partition", label);
         }
 
         @Override
@@ -175,6 +190,8 @@ public final class Engine implements AutoCloseable {
             }
             if (command != null) {
                 var result = books.computeIfAbsent(command.symbol(), OrderBook::new).apply(command);
+                commandsApplied.increment();
+                fillsEmitted.add(result.fills().size());
                 for (var fill : result.fills()) {
                     producer.send(new ProducerRecord<>(Topics.FILLS, fill.symbol(), Json.toBytes(fill)));
                 }
@@ -225,6 +242,7 @@ public final class Engine implements AutoCloseable {
             } catch (IOException e) {
                 throw new UncheckedIOException("failed to write snapshot " + snapshotPath, e);
             }
+            snapshotsWritten.increment();
         }
 
         void stop() {

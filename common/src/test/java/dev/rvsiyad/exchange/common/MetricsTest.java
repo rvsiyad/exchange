@@ -61,6 +61,14 @@ class MetricsTest {
     }
 
     @Test
+    void counterTotalSumsAcrossLabels() {
+        Metrics.counter("cmds_total", "commands", "partition", "0").add(3);
+        Metrics.counter("cmds_total", "commands", "partition", "1").add(4);
+        assertEquals(7, Metrics.counterTotal("cmds_total"));
+        assertEquals(0, Metrics.counterTotal("never_registered_total"));
+    }
+
+    @Test
     void aNameCannotBeBothCounterAndGauge() {
         Metrics.counter("x_total", "x");
         assertThrows(IllegalArgumentException.class, () -> Metrics.gauge("x_total", "x"));

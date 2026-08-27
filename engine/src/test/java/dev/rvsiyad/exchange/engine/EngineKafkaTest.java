@@ -3,6 +3,7 @@ package dev.rvsiyad.exchange.engine;
 import dev.rvsiyad.exchange.common.BookUpdate;
 import dev.rvsiyad.exchange.common.Fill;
 import dev.rvsiyad.exchange.common.Json;
+import dev.rvsiyad.exchange.common.Metrics;
 import dev.rvsiyad.exchange.common.OrderCommand;
 import dev.rvsiyad.exchange.common.Side;
 import dev.rvsiyad.exchange.common.Topics;
@@ -107,6 +108,12 @@ class EngineKafkaTest {
                             new BookUpdate("SOL-USD", Side.SELL, 150_00, 4, 4)),
                     updates.stream().filter(u -> u.symbol().equals("SOL-USD")).toList());
         }
+
+        // The workers counted what they just did (summed across partition labels).
+        assertTrue(Metrics.counterTotal("engine_commands_total") >= 4,
+                "expected at least 4 commands counted, saw " + Metrics.counterTotal("engine_commands_total"));
+        assertTrue(Metrics.counterTotal("engine_fills_total") >= 2,
+                "expected at least 2 fills counted, saw " + Metrics.counterTotal("engine_fills_total"));
 
         // A fresh engine replays the whole log and re-emits byte-identical fills:
         // at-least-once by design, deduplicated downstream by deterministic fill id.

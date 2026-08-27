@@ -4,6 +4,7 @@ import com.sun.net.httpserver.HttpServer;
 import dev.rvsiyad.exchange.common.BookUpdate;
 import dev.rvsiyad.exchange.common.Fill;
 import dev.rvsiyad.exchange.common.Json;
+import dev.rvsiyad.exchange.common.Metrics;
 import dev.rvsiyad.exchange.common.ReservationRelease;
 import dev.rvsiyad.exchange.common.Side;
 import dev.rvsiyad.exchange.common.Topics;
@@ -140,6 +141,12 @@ class MarketDataServerTest {
             assertEquals(Set.of("book", "trade"), received.keySet());
             assertEquals(7, received.get("book").get("update").get("newQuantity").asLong());
             assertEquals(2, received.get("trade").get("trade").get("quantity").asLong());
+
+            // The fanout counted the client and what it pushed to it.
+            var scrape = Metrics.scrape();
+            assertTrue(scrape.contains("marketdata_clients 1"), scrape);
+            assertTrue(Metrics.counterTotal("marketdata_messages_total") >= 2,
+                    "expected at least the two deltas counted");
         } finally {
             ws.abort();
         }

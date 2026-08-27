@@ -6,6 +6,7 @@ import dev.rvsiyad.exchange.common.BookUpdate;
 import dev.rvsiyad.exchange.common.Fill;
 import dev.rvsiyad.exchange.common.FillsTopic;
 import dev.rvsiyad.exchange.common.Json;
+import dev.rvsiyad.exchange.common.Metrics;
 import dev.rvsiyad.exchange.common.Side;
 import dev.rvsiyad.exchange.common.Topics;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
@@ -37,6 +38,7 @@ import java.util.NavigableMap;
 import java.util.Properties;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Read-side of the exchange: rebuilds a live book per symbol from the
@@ -63,6 +65,15 @@ public final class MarketDataServer implements AutoCloseable {
     private static final Logger log = LoggerFactory.getLogger(MarketDataServer.class);
     private static final int MAX_DEPTH_LEVELS = 10;
     private static final int MAX_RECENT_TRADES = 20;
+
+    // Fanout health: how many clients are on the feed, how much it pushes,
+    // and — the ADR 0005 number — how often the bounded queues had to evict
+    // someone. Evictions climbing under load is backpressure doing its job;
+    // evictions climbing at idle is a bug.
+    private static final Metrics.Counter MESSAGES_SENT = Metrics.counter(
+            "marketdata_messages_total", "Feed messages enqueued to client send queues");
+    private static final Metrics.Counter EVICTIONS = Metrics.counter(
+            "marketdata_evictions_total", "Slow consumers evicted with a full send queue");
 
     record Level(long priceTicks, long quantity) {
     }
@@ -103,6 +114,7 @@ public final class MarketDataServer implements AutoCloseable {
     private final KafkaConsumer<String, byte[]> consumer;
     private final Thread consumerThread;
     private final WebSocketHub hub;
+    private final AtomicInteger connectedClients = new AtomicInteger();
     private long tradeSequence;
     private volatile boolean running = true;
     private HttpServer server;
@@ -114,6 +126,7 @@ public final class MarketDataServer implements AutoCloseable {
         this.consumer = new KafkaConsumer<>(consumerConfig());
         this.consumerThread = new Thread(this::consume, "market-data-consumer");
         this.hub = new WebSocketHub(new FeedClients());
+        Metrics.gaugeOf("marketdata_clients", "WebSocket clients currently subscribed", connectedClients::get);
     }
 
     public HttpServer start(int httpPort, int wsPort) throws IOException {
@@ -211,12 +224,15 @@ public final class MarketDataServer implements AutoCloseable {
         var payload = new String(Json.toBytes(message), StandardCharsets.UTF_8);
         var evicted = new ArrayList<WebSocketHub.Client>();
         for (var client : clients) {
-            if (!client.enqueue(payload)) {
+            if (client.enqueue(payload)) {
+                MESSAGES_SENT.increment();
+            } else {
                 evicted.add(client);
             }
         }
         for (var client : evicted) {
             clients.remove(client);
+            EVICTIONS.increment();
             log.warn("evicted slow websocket consumer on {}: send queue full", symbol);
         }
     }
@@ -275,6 +291,7 @@ public final class MarketDataServer implements AutoCloseable {
                         Json.toBytes(new SnapshotMessage("snapshot", snapshotLocked(symbol))),
                         StandardCharsets.UTF_8));
                 subscribers.computeIfAbsent(symbol, s -> new HashSet<>()).add(client);
+                connectedClients.incrementAndGet();
             }
         }
 
@@ -282,6 +299,7 @@ public final class MarketDataServer implements AutoCloseable {
         public void clientDisconnected(WebSocketHub.Client client) {
             synchronized (lock) {
                 subscribers.values().forEach(clients -> clients.remove(client));
+                connectedClients.decrementAndGet();
             }
         }
     }

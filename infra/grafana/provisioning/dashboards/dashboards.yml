@@ -1,0 +1,10 @@
+apiVersion: 1
+
+# Dashboards ship with the repo, not with clicking: anything saved in the UI
+# is gone with the container, anything in this folder survives and reviews
+# like code.
+providers:
+  - name: exchange
+    type: file
+    options:
+      path: /etc/grafana/provisioning/dashboards

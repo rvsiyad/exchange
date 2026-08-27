@@ -99,6 +99,21 @@ public final class Metrics {
         return out.toString();
     }
 
+    /** Sum across every labeled series of a counter family; 0 if none registered. */
+    public static long counterTotal(String name) {
+        var family = FAMILIES.get(name);
+        if (family == null) {
+            return 0;
+        }
+        long total = 0;
+        for (var series : family.series.values()) {
+            if (series.metric instanceof Counter counter) {
+                total += counter.value();
+            }
+        }
+        return total;
+    }
+
     /** Test hook: a fresh registry, because the JVM-wide one outlives any one test. */
     public static void clear() {
         FAMILIES.clear();

@@ -32,7 +32,9 @@ worst-case cost in TigerBeetle before they reach the log — an order you cannot
 afford is rejected by the ledger database itself with a 422. Ports/config via
 `KAFKA_BOOTSTRAP`, `TIGERBEETLE_ADDRESS` (3000), `GATEWAY_PORT` (8091),
 `MARKET_DATA_PORT` (8090), `MARKET_DATA_WS_PORT` (8092), `GATEWAY_URL`,
-`ENGINE_SNAPSHOT_DIR`, `ENGINE_SNAPSHOT_EVERY`.
+`ENGINE_SNAPSHOT_DIR`, `ENGINE_SNAPSHOT_EVERY`, and `*_METRICS_PORT` for the
+four Prometheus scrape targets (gateway 7001, engine 7002, settlement 7003,
+market-data 7004).
 
 The page rides the WebSocket feed (snapshot on connect, deltas after): the
 book, tape, and TigerBeetle balances update live, and a dropped or evicted
@@ -52,3 +54,34 @@ a Maven multi-module monorepo.
 
 Decisions are written up as ADRs in [docs/adr](docs/adr); the running lab
 notebook is [docs/LEARNING.md](docs/LEARNING.md).
+
+## Proving correctness: the order storm
+
+`./mvnw -pl storm test` assembles the real gateway, engine and settlement over
+real Kafka and TigerBeetle, storms them with 8 concurrent users firing 800
+randomized orders and cancels (funding deliberately tight, so the ledger
+rejects some), and then asserts the invariants that define a financial system
+— no matter how the orders interleaved:
+
+- **conservation of money**: everything the treasury issued is in a user
+  account, and escrow nets to exactly zero once settlement catches up
+- **no negative balances**, any user, any asset
+- **every fill settled exactly once**, proven by the deterministic transfer
+  ids in the ledger
+- **book ↔ ledger agreement**: the holds implied by the engine's final
+  snapshots equal the ledger's pending reservations to the cent
+- **no crossed books**
+
+The scenario derives from one seed (printed on every run); a failure
+reproduces with `-Dstorm.seed=<seed>`. The interleaving is deliberately not
+reproducible — every run tries a new one against the same invariants. The
+storm runs in CI on every push.
+
+## Observability
+
+Every service serves Prometheus metrics on its own port; the compose
+Prometheus scrapes them and a provisioned Grafana dashboard at
+http://localhost:3001/d/exchange shows orders/s, fills/s, settlement lag,
+per-partition engine load (the hot-symbol tradeoff of ADR 0001, live),
+rejections by reason, and feed clients/evictions. The dashboard ships with
+the repo — `docker compose up -d prometheus grafana` and it exists.

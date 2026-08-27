@@ -300,6 +300,54 @@ public final class Ledger implements AutoCloseable {
                 .orElse(new AssetBalance(asset, 0, 0, 0));
     }
 
+    // Read APIs for the system invariants (the order-storm test asserts them;
+    // an auditor would run the same queries): conservation is
+    // treasuryIssued == sum of user totals + escrowPosted, and a caught-up
+    // system has escrowPosted == 0 — fills route money *through* escrow, but
+    // every settlement chain nets it back out.
+
+    /** How much of one asset the treasury has issued into circulation: its net debit balance. */
+    public long treasuryIssued(String asset) {
+        var view = accountView(LedgerIds.treasury(asset), asset + " treasury");
+        return view.debitsPosted() - view.creditsPosted();
+    }
+
+    /** Escrow's settled balance; exactly zero whenever settlement is caught up. */
+    public long escrowPosted(String asset) {
+        var view = accountView(LedgerIds.escrow(asset), asset + " escrow");
+        return view.creditsPosted() - view.debitsPosted();
+    }
+
+    /** The sum of every open reservation's hold for one asset (escrow's pending credits). */
+    public long escrowPending(String asset) {
+        return accountView(LedgerIds.escrow(asset), asset + " escrow").creditsPending();
+    }
+
+    /**
+     * Whether a fill's settlement chain reached the ledger. The chain is
+     * atomic, so its last member (the quote payout) existing proves all of it
+     * ran — and deterministic ids mean it can never have run twice.
+     */
+    public boolean fillSettled(String fillId) {
+        return transferExists(LedgerIds.payout(fillId, "quote"));
+    }
+
+    private record AccountView(long debitsPosted, long creditsPosted, long creditsPending) {
+    }
+
+    private AccountView accountView(byte[] accountId, String what) {
+        var ids = new IdBatch(1);
+        ids.add(accountId);
+        var found = client.lookupAccounts(ids);
+        if (!found.next()) {
+            throw new IllegalStateException(what + " account not found");
+        }
+        return new AccountView(
+                found.getDebitsPosted().longValueExact(),
+                found.getCreditsPosted().longValueExact(),
+                found.getCreditsPending().longValueExact());
+    }
+
     private record Failure(int index, CreateTransferResult result) {
         @Override
         public String toString() {

@@ -58,6 +58,11 @@ public final class SettlementService implements AutoCloseable {
             "settlement_failures_total", "Fills or releases the ledger refused");
     private static final Metrics.Gauge LAG_SECONDS = Metrics.gauge(
             "settlement_lag_seconds", "Age of the last settled fill: now minus its match timestamp");
+    // Every decoded event, duplicates included — this counter reaching the
+    // stream's record count is what "settlement has caught up" means, which
+    // is exactly the quiescence check the storm test needs.
+    private static final Metrics.Counter EVENTS = Metrics.counter(
+            "settlement_events_total", "Fills-topic events consumed (fills and releases, duplicates included)");
 
     private final Ledger ledger;
     private final KafkaConsumer<String, byte[]> consumer;
@@ -109,6 +114,7 @@ public final class SettlementService implements AutoCloseable {
     }
 
     private void handle(dev.rvsiyad.exchange.common.FillsTopicEvent event) {
+        EVENTS.increment();
         switch (event) {
             case Fill fill -> settle(fill);
             case ReservationRelease release -> release(release);

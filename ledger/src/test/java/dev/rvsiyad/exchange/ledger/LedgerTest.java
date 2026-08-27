@@ -13,6 +13,8 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * The session-4 "scratch REPL against TigerBeetle" captured as tests: watch
@@ -163,5 +165,28 @@ class LedgerTest {
         assertEquals(Ledger.VoidResult.ALREADY_RELEASED, ledger.voidReservation("s3", 0));
         assertEquals(Ledger.VoidResult.VOIDED, ledger.voidReservation("s3", 1));
         assertEquals(0, ledger.balance("bob", "ETH").reserved());
+    }
+
+    @Test
+    @Order(9)
+    void theInvariantReadersBalanceTheWholeBook() {
+        // Everything above settled or voided, so escrow keeps nothing...
+        assertEquals(0, ledger.escrowPosted("USD"));
+        assertEquals(0, ledger.escrowPosted("ETH"));
+        assertEquals(0, ledger.escrowPending("USD"));
+        assertEquals(0, ledger.escrowPending("ETH"));
+
+        // ...and every unit the treasury issued sits in a user account: conservation.
+        for (var asset : new String[]{"USD", "ETH"}) {
+            long circulating = 0;
+            for (var user : new String[]{"alice", "bob", "carol", "mallory"}) {
+                circulating += ledger.balance(user, asset).total();
+            }
+            assertEquals(ledger.treasuryIssued(asset), circulating,
+                    "conservation of " + asset);
+        }
+
+        assertTrue(ledger.fillSettled("ETH-USD-1"));
+        assertFalse(ledger.fillSettled("ETH-USD-never-happened"));
     }
 }

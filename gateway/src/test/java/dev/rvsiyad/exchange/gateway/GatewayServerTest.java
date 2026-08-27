@@ -2,6 +2,7 @@ package dev.rvsiyad.exchange.gateway;
 
 import dev.rvsiyad.exchange.common.CommandType;
 import dev.rvsiyad.exchange.common.Json;
+import dev.rvsiyad.exchange.common.Metrics;
 import dev.rvsiyad.exchange.common.OrderCommand;
 import dev.rvsiyad.exchange.common.Side;
 import dev.rvsiyad.exchange.common.Topics;
@@ -171,6 +172,24 @@ class GatewayServerTest {
         assertEquals(405, http.send(
                 HttpRequest.newBuilder(URI.create(baseUrl + "/api/orders")).GET().build(),
                 HttpResponse.BodyHandlers.ofString()).statusCode());
+    }
+
+    @Test
+    void acceptedAndRejectedOrdersAreCounted() throws Exception {
+        var accepted = Metrics.counter("gateway_orders_accepted_total", "");
+        var rejected = Metrics.counter("gateway_orders_rejected_total", "", "reason", "insufficient_funds");
+        long acceptedBefore = accepted.value();
+        long rejectedBefore = rejected.value();
+
+        assertEquals(202, post("/api/orders",
+                "{\"userId\":\"alice\",\"symbol\":\"ETH-USD\",\"side\":\"BUY\",\"priceTicks\":100,\"quantity\":1}")
+                .statusCode());
+        assertEquals(422, post("/api/orders",
+                "{\"userId\":\"mallory\",\"symbol\":\"ETH-USD\",\"side\":\"BUY\",\"priceTicks\":200000,\"quantity\":1}")
+                .statusCode());
+
+        assertEquals(acceptedBefore + 1, accepted.value());
+        assertEquals(rejectedBefore + 1, rejected.value());
     }
 
     private static HttpResponse<String> post(String path, String body) throws Exception {

@@ -4,6 +4,7 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import dev.rvsiyad.exchange.common.Assets;
 import dev.rvsiyad.exchange.common.Json;
+import dev.rvsiyad.exchange.common.Metrics;
 import dev.rvsiyad.exchange.common.OrderCommand;
 import dev.rvsiyad.exchange.common.Side;
 import dev.rvsiyad.exchange.common.Topics;
@@ -49,6 +50,14 @@ public final class GatewayServer implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(GatewayServer.class);
     private static final long PUBLISH_TIMEOUT_SECONDS = 10;
+
+    // The RED view of order entry: everything that comes in is either accepted
+    // (funds held, durably in the log) or rejected with a reason — the reason
+    // label is what turns a 4xx blip on a dashboard into a diagnosis.
+    private static final Metrics.Counter ORDERS_ACCEPTED = Metrics.counter(
+            "gateway_orders_accepted_total", "Orders with funds reserved and durably published to the log");
+    private static final Metrics.Counter CANCELS_ACCEPTED = Metrics.counter(
+            "gateway_cancels_accepted_total", "Cancel commands durably published to the log");
 
     record NewOrderRequest(String userId, String symbol, Side side, long priceTicks, long quantity) {
     }
@@ -98,18 +107,18 @@ public final class GatewayServer implements AutoCloseable {
         try {
             request = Json.fromBytes(exchange.getRequestBody().readAllBytes(), NewOrderRequest.class);
         } catch (RuntimeException e) {
-            respond(exchange, 400, "malformed request".getBytes(), "text/plain");
+            rejectOrder(exchange, 400, "malformed request", "malformed");
             return;
         }
         if (isBlank(request.userId()) || isBlank(request.symbol()) || request.side() == null
                 || request.priceTicks() <= 0 || request.quantity() <= 0) {
-            respond(exchange, 400,
-                    "userId, symbol, side, positive priceTicks and quantity required".getBytes(), "text/plain");
+            rejectOrder(exchange, 400,
+                    "userId, symbol, side, positive priceTicks and quantity required", "invalid_fields");
             return;
         }
         var instrument = Assets.parseSymbol(request.symbol()).orElse(null);
         if (instrument == null) {
-            respond(exchange, 400, "unknown symbol".getBytes(), "text/plain");
+            rejectOrder(exchange, 400, "unknown symbol", "unknown_symbol");
             return;
         }
 
@@ -121,7 +130,7 @@ public final class GatewayServer implements AutoCloseable {
             try {
                 reserveAmount = Math.multiplyExact(request.priceTicks(), request.quantity());
             } catch (ArithmeticException e) {
-                respond(exchange, 400, "order cost overflows".getBytes(), "text/plain");
+                rejectOrder(exchange, 400, "order cost overflows", "cost_overflow");
                 return;
             }
         } else {
@@ -135,11 +144,11 @@ public final class GatewayServer implements AutoCloseable {
         }
         switch (ledger.reserve(orderId, request.userId(), reserveAsset, reserveAmount)) {
             case INSUFFICIENT_FUNDS -> {
-                respond(exchange, 422, "insufficient funds".getBytes(), "text/plain");
+                rejectOrder(exchange, 422, "insufficient funds", "insufficient_funds");
                 return;
             }
             case FAILED -> {
-                respond(exchange, 503, "ledger unavailable".getBytes(), "text/plain");
+                rejectOrder(exchange, 503, "ledger unavailable", "ledger_unavailable");
                 return;
             }
             case RESERVED -> {
@@ -150,12 +159,13 @@ public final class GatewayServer implements AutoCloseable {
                 orderId, request.userId(), request.symbol(), request.side(),
                 request.priceTicks(), request.quantity(), epochNanos());
         if (publish(command)) {
+            ORDERS_ACCEPTED.increment();
             respond(exchange, 202, Json.toBytes(new AcceptedResponse(orderId)), "application/json");
         } else {
             // The order never reached the log, so nothing downstream will ever
             // settle or void it — release the hold before failing the request.
             ledger.voidReservation(orderId, 0);
-            respond(exchange, 503, "order log unavailable".getBytes(), "text/plain");
+            rejectOrder(exchange, 503, "order log unavailable", "log_unavailable");
         }
     }
 
@@ -180,6 +190,7 @@ public final class GatewayServer implements AutoCloseable {
         // anything, and settlement voids the reservation when it says so.
         var command = OrderCommand.cancel(request.orderId(), request.userId(), request.symbol(), epochNanos());
         if (publish(command)) {
+            CANCELS_ACCEPTED.increment();
             respond(exchange, 202, Json.toBytes(new AcceptedResponse(request.orderId())), "application/json");
         } else {
             respond(exchange, 503, "order log unavailable".getBytes(), "text/plain");
@@ -223,6 +234,12 @@ public final class GatewayServer implements AutoCloseable {
 
     private static boolean isBlank(String value) {
         return value == null || value.isBlank();
+    }
+
+    private static void rejectOrder(HttpExchange exchange, int status, String message, String reason) throws IOException {
+        Metrics.counter("gateway_orders_rejected_total",
+                "Orders rejected before reaching the log, by reason", "reason", reason).increment();
+        respond(exchange, status, message.getBytes(), "text/plain");
     }
 
     private static void respond(HttpExchange exchange, int status, byte[] body, String contentType) throws IOException {

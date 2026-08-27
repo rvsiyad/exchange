@@ -26,6 +26,7 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
@@ -89,6 +90,12 @@ public final class GatewayServer implements AutoCloseable {
 
     public HttpServer start(int port) throws IOException {
         server = HttpServer.create(new InetSocketAddress(port), 0);
+        // Without an executor the JDK server runs every handler on its one
+        // dispatcher thread — a serial gateway. A virtual thread per request
+        // makes order entry actually concurrent; the safety story is
+        // unchanged because reservations are atomic in the ledger, not in
+        // application locks.
+        server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
         server.createContext("/health", exchange -> respond(exchange, 200, "ok".getBytes(), "text/plain"));
         server.createContext("/api/orders", this::placeOrder);
         server.createContext("/api/cancel", this::cancelOrder);
@@ -139,8 +146,13 @@ public final class GatewayServer implements AutoCloseable {
         }
 
         var orderId = "o-" + UUID.randomUUID();
-        if (knownUsers.add(request.userId())) {
+        // First contact creates the user's accounts. Every racer on a brand-new
+        // user runs the (idempotent) creation itself — marking the user known
+        // first would open a window where a concurrent request reserves against
+        // accounts that do not exist yet.
+        if (!knownUsers.contains(request.userId())) {
             ledger.ensureUserAccounts(request.userId());
+            knownUsers.add(request.userId());
         }
         switch (ledger.reserve(orderId, request.userId(), reserveAsset, reserveAmount)) {
             case INSUFFICIENT_FUNDS -> {

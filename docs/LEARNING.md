@@ -5,6 +5,57 @@ what broke, what I'd say in an interview. Raw material — no polish needed.
 
 ---
 
+## 2026-08-28 · Session 8 — ship it: deploy kit, CD, the design doc (PRs #42–#46)
+
+**What went in:** runnable service jars (#42) → VM provisioning kit +
+systemd units (#43) → deploy-on-merge workflow completing the CI pipeline
+(#44) → README as design doc with as-built architecture diagrams (#45) →
+these docs (#46).
+
+**The one-sentence version:** deployment is code too — the target VM is
+described entirely by the repo (one idempotent setup script, four unit
+files, one redeploy script CD can call), so provisioning is a command, not
+an afternoon.
+
+**What surprised / what broke:**
+
+- `exec:java` doesn't survive contact with production: the services ran
+  fine under Maven and had no way to run without it. The boring fix
+  (manifest main class + `lib/` classpath + copy-dependencies) is one
+  plugin block per service, and `java -jar` becomes the deploy contract.
+- The dashboard would have been empty *only in production*:
+  `host.docker.internal` resolves by magic on Docker Desktop and not at all
+  on a Linux VM — Prometheus needed `host-gateway` mapped explicitly. The
+  kind of bug you only find by treating the deploy environment as real.
+- CD before a target exists is a solved problem: gate the job on a
+  repository variable so it skips green until `DEPLOY_ENABLED=true`, and
+  make the redeploy script's health check the workflow's exit code — a
+  deploy that doesn't come back healthy fails the run, not just the VM.
+- Least privilege fell out naturally: the CD key can run exactly one
+  sudoers-whitelisted command. No third-party deploy actions to audit —
+  plain ssh.
+- The architecture diagram had to be drawn *as built*, not as planned:
+  Postgres is in the compose file but no code path uses it, and the UI
+  reaches the gateway through the market-data proxy. A design doc that
+  flatters the plan instead of describing the system is worse than none.
+
+**Interview lines earned this session:**
+
+- "The VM is cattle: everything it is, is a script in the repo — reprovision
+  from scratch is one command."
+- "CD's health check is the workflow's exit code; a bad deploy fails loudly
+  in the PR timeline, not silently on the box."
+- "Killing the box and restarting it is our session-3 recovery demo, not an
+  incident — snapshots + replay rebuild the book, settlement replays into
+  deterministic transfer ids."
+
+**Still open (deliberately):** provisioning the actual Oracle free-tier VM
+(account + firewall + one run of `deploy/setup.sh`, then flip
+`DEPLOY_ENABLED`), the 2-minute demo recording as fallback, the
+end-of-project ADR teach-back deep dive, and the rvsiyad.dev write-up.
+
+---
+
 ## 2026-08-28 · Session 7 — measurement: the latency benchmark (PRs #37–#41)
 
 **What went in:** HdrHistogram-backed summary metric in the registry (#37) →

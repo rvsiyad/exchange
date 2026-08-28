@@ -1,17 +1,19 @@
 package dev.rvsiyad.exchange.common;
 
+import org.HdrHistogram.ConcurrentHistogram;
+
 import java.util.ArrayList;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.DoubleSupplier;
 
 /**
- * A deliberately tiny Prometheus registry: counters, gauges, and the text
- * exposition format — nothing else. The services need exactly three shapes of
- * fact ("this happened N times", "this is currently X", broken out by label),
- * and hand-rolling them keeps the hot paths on LongAdder and the dependency
- * tree empty. What a real client library adds (histograms, exemplars, protobuf
- * exposition) arrives with the session-7 HdrHistogram benchmark if needed.
+ * A deliberately tiny Prometheus registry: counters, gauges, latency
+ * summaries, and the text exposition format — nothing else. The services need
+ * exactly these shapes of fact ("this happened N times", "this is currently
+ * X", "this duration's distribution", broken out by label), and hand-rolling
+ * them keeps the hot paths on LongAdder and HdrHistogram and the dependency
+ * tree nearly empty.
  *
  * Registration is idempotent: asking for the same series twice returns the
  * same instance, so call sites just declare what they increment and never
@@ -22,6 +24,9 @@ public final class Metrics {
 
     /** family name -> help + series; sorted so scrapes render deterministically. */
     private static final ConcurrentSkipListMap<String, Family> FAMILIES = new ConcurrentSkipListMap<>();
+
+    /** The tail is the story: the summary exports the median and then the far percentiles. */
+    private static final double[] QUANTILES = {0.5, 0.9, 0.99, 0.999};
 
     private Metrics() {
     }
@@ -57,6 +62,36 @@ public final class Metrics {
         }
     }
 
+    /**
+     * A latency distribution, recorded in nanoseconds, exported as a
+     * Prometheus summary with precomputed quantiles. Backed by HdrHistogram
+     * (3 significant digits, auto-resizing) rather than fixed Prometheus
+     * buckets: the interesting question here is "what is p99.9, exactly?",
+     * and bucketed histograms can only answer it to bucket resolution.
+     */
+    public static final class Histogram {
+        private final ConcurrentHistogram values = new ConcurrentHistogram(3);
+        private final LongAdder sumNanos = new LongAdder();
+
+        public void observeNanos(long nanos) {
+            long clamped = Math.max(0, nanos);
+            values.recordValue(clamped);
+            sumNanos.add(clamped);
+        }
+
+        public long count() {
+            return values.getTotalCount();
+        }
+
+        public double quantileSeconds(double quantile) {
+            return values.getValueAtPercentile(quantile * 100.0) / 1e9;
+        }
+
+        double sumSeconds() {
+            return sumNanos.sum() / 1e9;
+        }
+    }
+
     /** Labels are name-value pairs: counter("x_total", "...", "reason", "bad_symbol"). */
     public static Counter counter(String name, String help, String... labels) {
         var series = family(name, help, "counter").series(labels);
@@ -79,6 +114,14 @@ public final class Metrics {
         gauge(name, help, labels).supplier = supplier;
     }
 
+    public static Histogram histogram(String name, String help, String... labels) {
+        var series = family(name, help, "summary").series(labels);
+        if (series.metric == null) {
+            series.metric = new Histogram();
+        }
+        return (Histogram) series.metric;
+    }
+
     /** The Prometheus text exposition (version 0.0.4) of every registered series. */
     public static String scrape() {
         var out = new StringBuilder();
@@ -87,13 +130,26 @@ public final class Metrics {
             out.append("# HELP ").append(familyEntry.getKey()).append(' ').append(family.help).append('\n');
             out.append("# TYPE ").append(familyEntry.getKey()).append(' ').append(family.type).append('\n');
             for (var seriesEntry : family.series.entrySet()) {
-                out.append(familyEntry.getKey()).append(seriesEntry.getKey()).append(' ');
-                if (seriesEntry.getValue().metric instanceof Counter counter) {
-                    out.append(counter.value());
-                } else if (seriesEntry.getValue().metric instanceof Gauge gauge) {
-                    out.append(render(gauge.read()));
+                var name = familyEntry.getKey();
+                var labels = seriesEntry.getKey();
+                switch (seriesEntry.getValue().metric) {
+                    case Counter counter ->
+                            out.append(name).append(labels).append(' ').append(counter.value()).append('\n');
+                    case Gauge gauge ->
+                            out.append(name).append(labels).append(' ').append(render(gauge.read())).append('\n');
+                    case Histogram histogram -> {
+                        for (var quantile : QUANTILES) {
+                            out.append(name).append(withQuantile(labels, quantile)).append(' ')
+                                    .append(histogram.quantileSeconds(quantile)).append('\n');
+                        }
+                        out.append(name).append("_sum").append(labels).append(' ')
+                                .append(histogram.sumSeconds()).append('\n');
+                        out.append(name).append("_count").append(labels).append(' ')
+                                .append(histogram.count()).append('\n');
+                    }
+                    default -> {
+                    }
                 }
-                out.append('\n');
             }
         }
         return out.toString();
@@ -125,6 +181,14 @@ public final class Metrics {
             throw new IllegalArgumentException(name + " is already registered as a " + family.type);
         }
         return family;
+    }
+
+    /** Merges the summary's quantile label into a series' existing label set. */
+    private static String withQuantile(String labels, double quantile) {
+        var pair = "quantile=\"" + quantile + "\"";
+        return labels.isEmpty()
+                ? "{" + pair + "}"
+                : labels.substring(0, labels.length() - 1) + "," + pair + "}";
     }
 
     private static String render(double value) {

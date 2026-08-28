@@ -128,6 +128,37 @@
           "refId": "A"
         }
       ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Order → settled latency",
+      "description": "Gateway-accept to funds-settled, from the settlement_latency_seconds summary: the median and the tails.",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        {
+          "expr": "settlement_latency_seconds{quantile=\"0.5\"}",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "settlement_latency_seconds{quantile=\"0.9\"}",
+          "legendFormat": "p90",
+          "refId": "B"
+        },
+        {
+          "expr": "settlement_latency_seconds{quantile=\"0.99\"}",
+          "legendFormat": "p99",
+          "refId": "C"
+        },
+        {
+          "expr": "settlement_latency_seconds{quantile=\"0.999\"}",
+          "legendFormat": "p99.9",
+          "refId": "D"
+        }
+      ]
     }
   ]
 }

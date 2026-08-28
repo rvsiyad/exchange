@@ -52,7 +52,64 @@ atomic linked chain (post both holds, re-reserve remainders, pay out of escrow),
 cancels void — and no application code ever checks a balance. Built in Java 21 as
 a Maven multi-module monorepo.
 
-Decisions are written up as ADRs in [docs/adr](docs/adr); the running lab
+```mermaid
+flowchart LR
+    ui[UI] -->|"orders (proxied)"| md
+    ui <-->|WebSocket| md[market-data]
+    md -->|REST| gw[gateway]
+    gw -->|"1: reserve funds\n(pending transfer)"| tb[(TigerBeetle)]
+    gw -->|"2: OrderCommand"| k1[["orders topic\n(keyed by symbol,\n4 partitions)"]]
+    k1 --> eng["engine\nin-memory books,\none thread per partition"]
+    eng -->|"snapshot + replay"| k1
+    eng --> k2[[fills topic]]
+    eng --> k3[[book-updates topic]]
+    k2 --> settle[settlement]
+    settle -->|"post / void\nlinked transfers"| tb
+    k2 --> md
+    k3 --> md
+    gw & eng & settle & md -.->|/metrics| prom[Prometheus] --> graf[Grafana]
+```
+
+An order's life, end to end:
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant G as gateway
+    participant T as TigerBeetle
+    participant K as Kafka
+    participant E as engine
+    participant S as settlement
+    C->>G: POST /api/orders
+    G->>T: create PENDING transfer (reserve worst case)
+    T-->>G: ok — or insufficient funds → 422
+    G->>K: OrderCommand → orders (key = symbol, acks=all)
+    G-->>C: 202 (durably in the log; fills arrive on the tape)
+    K->>E: consume (single writer per partition)
+    E->>E: match, price-time priority
+    E->>K: Fill + BookUpdate events
+    K->>S: consume fills (idempotent, replays from start)
+    S->>T: post reservations + pay out, one LINKED chain
+    Note over S,T: cancel → VOID pending transfer (release)
+```
+
+| Module | Responsibility | Concurrency story |
+|---|---|---|
+| `common` | Event schemas, JSON serde, metrics registry | shared, dependency-light |
+| `ledger` | Every TigerBeetle conversation: accounts, reserve/post/void, invariant reads | thread-safe client; invariants enforced by the database |
+| `gateway` | REST order entry, validation, fund reservation, Kafka producer | virtual thread per request |
+| `engine` | Event-sourced matching, snapshot + replay | **single writer per partition** — lock-free by architecture |
+| `settlement` | Fills → linked transfer chains | idempotent consumer, exactly-once *effect* |
+| `market-data` | Book/tape projection, WebSocket fanout, demo UI | bounded per-client queues, slow-consumer eviction |
+| `storm` | Whole-system property test | the proof: invariants under randomized concurrency |
+| `bench` | Open-loop latency benchmark | the numbers: percentiles under constant load |
+
+Decisions are written up as ADRs — [single writer per
+partition](docs/adr/0001-single-writer-per-partition.md), [TigerBeetle +
+Postgres split](docs/adr/0002-tigerbeetle-plus-postgres.md), [the log is the
+database](docs/adr/0003-event-sourced-engine.md), [reservation beats
+check-then-debit](docs/adr/0004-pending-transfer-reservation.md), [fanout
+backpressure](docs/adr/0005-fanout-backpressure.md) — and the running lab
 notebook is [docs/LEARNING.md](docs/LEARNING.md).
 
 ## Proving correctness: the order storm
@@ -97,6 +154,14 @@ bottleneck is settlement (one linked TigerBeetle chain per fill, single
 consumer), which saturates near ~1,000 fills/s — batching chains into one
 TigerBeetle submission is the designed-for fix. Full methodology, all rates,
 and the two findings worth reading: [docs/benchmarks.md](docs/benchmarks.md).
+
+## Deploying
+
+One VM runs the whole venue: infra in Docker, the four services as systemd
+units on packaged jars (`./mvnw package` produces executable jars), and CD
+redeploys on every merge to `main` once the target's secrets exist —
+[deploy/README.md](deploy/README.md) is the walkthrough, sized for Oracle's
+free-tier ARM shape.
 
 ## Observability
 

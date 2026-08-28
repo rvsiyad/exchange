@@ -3,6 +3,7 @@ name: exchange
 services:
   redpanda:
     image: redpandadata/redpanda:latest
+    restart: unless-stopped
     command:
       - redpanda
       - start
@@ -37,6 +38,7 @@ services:
 
   console:
     image: redpandadata/console:latest
+    restart: unless-stopped
     depends_on:
       redpanda:
         condition: service_healthy
@@ -47,6 +49,7 @@ services:
 
   tigerbeetle:
     image: ghcr.io/tigerbeetle/tigerbeetle:0.16.27
+    restart: unless-stopped
     # Single replica (--replica-count=1) is a dev-only topology; production runs 6.
     # Format once if the datafile doesn't exist, then start.
     entrypoint: ["/bin/sh", "-c"]
@@ -63,6 +66,7 @@ services:
 
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_DB: exchange
       POSTGRES_USER: exchange
@@ -80,13 +84,20 @@ services:
 
   prometheus:
     image: prom/prometheus:latest
+    restart: unless-stopped
     volumes:
       - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    # The scrape targets are the JVM services on the host. Docker Desktop
+    # resolves host.docker.internal by itself; plain Linux (the deploy VM)
+    # needs it mapped to the host gateway explicitly.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "9090:9090"
 
   grafana:
     image: grafana/grafana:latest
+    restart: unless-stopped
     environment:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Admin

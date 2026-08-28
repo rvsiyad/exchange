@@ -72,6 +72,46 @@ class MetricsTest {
     void aNameCannotBeBothCounterAndGauge() {
         Metrics.counter("x_total", "x");
         assertThrows(IllegalArgumentException.class, () -> Metrics.gauge("x_total", "x"));
+        assertThrows(IllegalArgumentException.class, () -> Metrics.histogram("x_total", "x"));
+    }
+
+    @Test
+    void histogramsExportQuantilesSumAndCount() {
+        var latency = Metrics.histogram("settle_seconds", "settle latency");
+        for (int i = 1; i <= 1000; i++) {
+            latency.observeNanos(i * 1_000_000L);   // 1ms .. 1000ms, uniform
+        }
+
+        var scrape = Metrics.scrape();
+        assertTrue(scrape.contains("# TYPE settle_seconds summary"), scrape);
+        // HdrHistogram keeps 3 significant digits, so quantiles land within
+        // 0.1% of the exact answer for this uniform distribution.
+        assertNear(0.500, scraped(scrape, "settle_seconds{quantile=\"0.5\"}"));
+        assertNear(0.990, scraped(scrape, "settle_seconds{quantile=\"0.99\"}"));
+        assertNear(0.999, scraped(scrape, "settle_seconds{quantile=\"0.999\"}"));
+        assertNear(500.5, scraped(scrape, "settle_seconds_sum"));
+        assertEquals(1000, (long) scraped(scrape, "settle_seconds_count"));
+    }
+
+    @Test
+    void histogramQuantilesMergeIntoExistingLabels() {
+        Metrics.histogram("match_seconds", "match latency", "symbol", "ETH-USD").observeNanos(1_000_000);
+        assertTrue(Metrics.scrape().contains("match_seconds{symbol=\"ETH-USD\",quantile=\"0.5\"}"),
+                Metrics.scrape());
+    }
+
+    private static void assertNear(double expected, double actual) {
+        assertTrue(Math.abs(actual - expected) <= expected * 0.005,
+                "expected ~" + expected + " but scraped " + actual);
+    }
+
+    private static double scraped(String scrape, String prefix) {
+        for (var line : scrape.split("\n")) {
+            if (line.startsWith(prefix + " ")) {
+                return Double.parseDouble(line.substring(prefix.length() + 1));
+            }
+        }
+        throw new AssertionError("no series " + prefix + " in:\n" + scrape);
     }
 
     @Test

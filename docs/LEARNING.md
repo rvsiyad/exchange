@@ -5,6 +5,75 @@ what broke, what I'd say in an interview. Raw material — no polish needed.
 
 ---
 
+## 2026-08-28 · Session 7 — measurement: the latency benchmark (PRs #37–#41)
+
+**What went in:** HdrHistogram-backed summary metric in the registry (#37) →
+settlement's end-to-end latency distribution (#38) → Grafana latency panel
+(#39) → the open-loop benchmark harness (#40) → methodology + numbers docs
+(#41).
+
+**The one-sentence version:** unmeasured systems don't count — and measuring
+correctly (open loop, latency from the *scheduled* send, warm-up discarded,
+percentiles not averages) is a discipline of its own, because the naive
+benchmark quietly flatters the system under test.
+
+**What surprised / what broke:**
+
+- Coordinated omission finally clicked by building the fix: a closed-loop
+  generator (send, wait, send) samples *less often* exactly when the system
+  is slow, so the worse the system, the better its numbers. The fix is two
+  moves: never wait (open loop, one dispatcher on a schedule, virtual thread
+  per in-flight request), and charge each order from the moment it was *due*,
+  not the moment it got sent. The harness also reports its own dispatch
+  lateness so an invalid run indicts itself.
+- **The benchmark found the bottleneck, and it isn't the matching path.**
+  Gateway → Kafka → engine holds order→fill p99 under 30ms all the way to
+  2,000 orders/s. Settlement — one idempotent consumer, one linked
+  TigerBeetle chain per fill — saturates between ~650 and ~975 fills/s, and
+  past that the backlog grows for as long as the load does (drains after;
+  money is late, never wrong). Textbook fix, deliberately deferred: batch
+  many fills' chains into one TigerBeetle submission — it's designed for
+  8k-transfer batches.
+- Higher load *improved* the median: p50 at 1,000/s (1.2ms) beats 500/s
+  (1.9ms), because at low rates Kafka's producer waits out linger before
+  shipping a batch. An average would have buried this; the distribution
+  surfaced it in one row.
+- One run of four came back with p99 7× the re-run — leftover containers
+  from a previous run were still shutting down. Benchmarks are experiments:
+  state the hardware, control the environment, re-run before believing a
+  weird number.
+- The whole-run `settlement_latency_seconds` summary can't exclude warm-up
+  (HdrHistogram in the registry has no reset-and-swap window), so its far
+  tail carries JIT and the TigerBeetle client's ~700ms session registration.
+  Documented rather than fixed: the harness-side spans are the clean ones.
+
+**Interview lines earned this session:**
+
+- "A closed-loop benchmark lets a slow system grade its own homework —
+  that's coordinated omission; I dispatch open-loop and measure from the
+  scheduled send."
+- "Order→fill p50 ~1.2ms, p99 ~20ms at a sustained 1,000 orders/s,
+  everything settled, on one box — and I can tell you exactly which stage
+  saturates first and why."
+- "The ledger is the bottleneck by design: one linked chain per fill is the
+  simplest correct thing, and TigerBeetle's batch API is the known
+  order-of-magnitude lever I haven't needed to pull."
+
+**Check-yourself questions for the teach-back:**
+
+1. Explain coordinated omission to someone who's never heard of it, using
+   the send-wait-send generator. Why does measuring from the actual send
+   time (instead of scheduled) hide stalls even in an open-loop harness?
+2. Why does the benchmark refuse to run on CI, and why is a rejection (422)
+   treated as a lost sample rather than a data point?
+3. Settlement backlogs at 1,500 orders/s but nothing is lost and nothing
+   breaks conservation. Walk through why — and what the batched-chain fix
+   changes about the settlement consumer's idempotency story.
+4. Why can p50 improve when offered load doubles? What would you look at to
+   confirm the linger explanation (which metric, which config knob)?
+
+---
+
 ## 2026-08-27 · Session 6 — proving correctness: the order storm (PRs #27–#36)
 
 **What went in:** hand-rolled Prometheus registry + `/metrics` per service

@@ -77,6 +77,27 @@ reproduces with `-Dstorm.seed=<seed>`. The interleaving is deliberately not
 reproducible — every run tries a new one against the same invariants. The
 storm runs in CI on every push.
 
+## Performance
+
+Measured with an open-loop, coordinated-omission-safe harness
+(`./mvnw -pl bench test -Dbench=true`): constant offered load, latency from
+the *scheduled* send time, warm-up discarded, HdrHistogram percentiles.
+Order→fill spans the whole pipeline — HTTP → gateway (TigerBeetle reserve +
+Kafka publish, `acks=all`) → engine match → `fills` topic observed.
+
+At 1,000 orders/s sustained for 60s, everything settled, on an Apple M4
+(one box, services in one JVM, Redpanda + TigerBeetle in containers):
+
+| | p50 | p90 | p99 | p99.9 |
+|---|---|---|---|---|
+| order→fill | 1.2ms | 7.5ms | 19.5ms | 62.9ms |
+
+The matching path holds p99 under 30ms to 2,000 orders/s; the measured
+bottleneck is settlement (one linked TigerBeetle chain per fill, single
+consumer), which saturates near ~1,000 fills/s — batching chains into one
+TigerBeetle submission is the designed-for fix. Full methodology, all rates,
+and the two findings worth reading: [docs/benchmarks.md](docs/benchmarks.md).
+
 ## Observability
 
 Every service serves Prometheus metrics on its own port; the compose

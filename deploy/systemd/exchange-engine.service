@@ -1,0 +1,17 @@
+[Unit]
+Description=exchange engine (event-sourced matching engine)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+User=exchange
+WorkingDirectory=/opt/exchange
+# Glob via sh so a version bump doesn't need a unit edit.
+ExecStart=/bin/sh -c 'exec java -jar engine/target/engine-*.jar'
+Restart=on-failure
+RestartSec=3
+# Config is environment-driven with local defaults; override here if needed,
+# e.g.: Environment=KAFKA_BOOTSTRAP=localhost:9092
+
+[Install]
+WantedBy=multi-user.target

@@ -58,6 +58,12 @@ public final class SettlementService implements AutoCloseable {
             "settlement_failures_total", "Fills or releases the ledger refused");
     private static final Metrics.Gauge LAG_SECONDS = Metrics.gauge(
             "settlement_lag_seconds", "Age of the last settled fill: now minus its match timestamp");
+    // The same span as the lag gauge, but kept as a distribution: order
+    // accepted at the gateway -> funds settled, the whole pipeline. The gauge
+    // answers "is settlement keeping up right now?"; this answers "what does
+    // the end-to-end tail look like?" — the session-7 benchmark question.
+    private static final Metrics.Histogram LATENCY = Metrics.histogram(
+            "settlement_latency_seconds", "Order accepted at the gateway to funds settled");
     // Every decoded event, duplicates included — this counter reaching the
     // stream's record count is what "settlement has caught up" means, which
     // is exactly the quiescence check the storm test needs.
@@ -137,7 +143,9 @@ public final class SettlementService implements AutoCloseable {
         switch (result) {
             case SETTLED -> {
                 FILLS_SETTLED.increment();
-                LAG_SECONDS.set((nowNanos() - fill.timestampNanos()) / 1_000_000_000.0);
+                long ageNanos = nowNanos() - fill.timestampNanos();
+                LAG_SECONDS.set(ageNanos / 1_000_000_000.0);
+                LATENCY.observeNanos(ageNanos);
                 log.info("settled {}: {} {} @ {} ({} -> {})",
                         fill.fillId(), fill.quantity(), legs.base(), fill.priceTicks(),
                         legs.sellerUserId(), legs.buyerUserId());

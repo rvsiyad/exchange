@@ -109,6 +109,9 @@ class SettlementServiceTest {
         // Bob delivered 2, was paid $40, and his open remainder of 3 is still held.
         assertEquals(new Ledger.AssetBalance("ETH", BOB_ETH - 2, 3, BOB_ETH - 5), ledger.balance("bob", "ETH"));
         assertEquals(new Ledger.AssetBalance("USD", 40_00, 0, 40_00), ledger.balance("bob", "USD"));
+
+        // The settled fill landed in the end-to-end latency distribution.
+        assertEquals(1, Metrics.histogram("settlement_latency_seconds", "").count());
     }
 
     @Test

@@ -27,10 +27,19 @@ install -m 644 deploy/systemd/*.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now exchange-engine exchange-settlement exchange-gateway exchange-market-data
 
+# Oracle's Ubuntu images reject all inbound traffic but SSH at the host
+# layer, on top of the cloud security list. Open the venue's public ports
+# there too; elsewhere these are no-ops ahead of an accept-all policy.
+for port in 8090 8092 3001; do
+  iptables -C INPUT -p tcp --dport "$port" -m state --state NEW -j ACCEPT 2>/dev/null \
+    || iptables -I INPUT -p tcp --dport "$port" -m state --state NEW -j ACCEPT
+done
+if command -v netfilter-persistent >/dev/null; then netfilter-persistent save; fi
+
 # CD: let the deploy key run exactly one command as root, nothing else.
 echo 'ubuntu ALL=(root) NOPASSWD: /opt/exchange/deploy/redeploy.sh' > /etc/sudoers.d/exchange-deploy
 chmod 440 /etc/sudoers.d/exchange-deploy
 
 sleep 5
 curl -fsS localhost:8091/health >/dev/null && echo "gateway healthy"
-echo "exchange is up — UI on :8090, Grafana on :3001 (open those ports in the cloud firewall)"
+echo "exchange is up — UI on :8090, WebSocket feed on :8092, Grafana on :3001 (open those ports in the cloud firewall)"

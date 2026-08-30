@@ -174,7 +174,12 @@
   // evicted as a slow consumer) is always recoverable ---
   async function connect() {
     const cfg = await (await fetch('/api/config')).json();
-    const ws = new WebSocket('ws://' + location.hostname + ':' + cfg.webSocketPort + '/ws?symbol=' + SYMBOL);
+    // over https a reverse proxy fronts everything on one origin, so the feed is
+    // wss on the same host; direct http access still dials the feed port itself
+    const feedUrl = location.protocol === 'https:'
+      ? 'wss://' + location.host + '/ws?symbol=' + SYMBOL
+      : 'ws://' + location.hostname + ':' + cfg.webSocketPort + '/ws?symbol=' + SYMBOL;
+    const ws = new WebSocket(feedUrl);
     ws.onopen = () => { $('feed').textContent = 'live'; $('feed').className = 'live'; };
     ws.onmessage = e => {
       const m = JSON.parse(e.data);

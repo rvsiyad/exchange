@@ -9,9 +9,17 @@ Ubuntu 24.04 box works.
 ## One-time setup
 
 1. **Provision the VM** — Ubuntu 24.04, 2+ OCPU / 8+ GB recommended. In the
-   cloud firewall / security list, open ingress TCP **8090** (UI + WebSocket)
-   and optionally **3001** (Grafana). Leave everything else closed — the
+   cloud firewall / security list, open ingress TCP **8090** (UI), **8092**
+   (WebSocket feed — the UI discovers it via `/api/config` and connects to
+   it directly, so without it the page loads but stays "connecting") and
+   optionally **3001** (Grafana). Leave everything else closed — the
    gateway (8091) is only reached through the market-data proxy.
+
+   The cloud firewall isn't the only layer: Oracle's Ubuntu images ship a
+   host-level iptables INPUT chain that rejects everything but SSH, so a
+   port can be open in the security list and still refused by the box.
+   setup.sh opens 8090/8092/3001 in that chain itself; on other images the
+   rules are inserted as harmless no-ops ahead of an accept-all policy.
 2. **Run the setup script** on the VM:
 
    ```

@@ -14,7 +14,14 @@
   #feed.live { color:var(--buy); }
   #feed.down { color:var(--sell); }
   .cols { display:flex; gap:16px; align-items:flex-start; flex-wrap:wrap; }
-  .panel { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:12px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:12px; transition:border-color .3s, box-shadow .3s; }
+  .panel.flash { border-color:#1f6feb; box-shadow:0 0 8px rgba(31,111,235,.55); }
+  #demo { display:flex; align-items:center; gap:12px; flex-wrap:wrap; background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:10px 12px; margin-bottom:16px; }
+  #demoRun { padding:6px 14px; border:0; border-radius:4px; background:#1f6feb; color:#fff; font:inherit; font-weight:bold; cursor:pointer; white-space:nowrap; }
+  #demoRun:disabled { opacity:.55; cursor:default; }
+  #demoText { flex:1; min-width:220px; }
+  #demoSub { color:var(--dim); font-size:12px; }
+  #demoDots { color:var(--dim); letter-spacing:3px; }
   .panel h2 { font-size:12px; text-transform:uppercase; letter-spacing:.08em; color:var(--dim); margin-bottom:8px; }
   #ticket { width:220px; }
   #ticket label { display:block; font-size:12px; color:var(--dim); margin:8px 0 2px; }
@@ -46,6 +53,14 @@
 <h1>exchange</h1>
 <div class="sub">BTC-USD · gateway → kafka → engine → kafka → market-data · funds in TigerBeetle
   <span id="feed" class="down">connecting</span></div>
+<div id="demo">
+  <button id="demoRun">Run demo</button>
+  <div id="demoText">
+    <div id="demoStep">New here? This runs a real trade through the exchange and explains what happens.</div>
+    <div id="demoSub">it places live orders through the same pipeline as the ticket below, nothing is staged</div>
+  </div>
+  <div id="demoDots">○○○○○</div>
+</div>
 <div class="cols">
   <div class="panel" id="ticket">
     <h2>Order ticket</h2>
@@ -139,6 +154,7 @@
     trades = trades.slice(0, TAPE);
     render();
     refreshBalances();   // fills move money; ask TigerBeetle (via the gateway) for the new truth
+    if (demoTradeHook) demoTradeHook(t);
   }
 
   function levels(map, descending) {
@@ -205,6 +221,158 @@
     }).join('');
   }
   $('user').onchange = refreshBalances;
+
+  // --- guided demo: a scripted scenario that goes through the real pipeline,
+  // so the tour doubles as proof the whole thing works end to end ---
+  let demoTradeHook = null;
+
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  function demoStep(main, sub) {
+    $('demoStep').textContent = main;
+    $('demoSub').textContent = sub || '';
+  }
+
+  function dots(done) { $('demoDots').textContent = '●'.repeat(done) + '○'.repeat(5 - done); }
+
+  function flash(id) {
+    $(id).classList.add('flash');
+    setTimeout(() => $(id).classList.remove('flash'), 1400);
+  }
+
+  // resolves with the next trade off the feed, or null if none shows up in time
+  function nextTrade(timeoutMs) {
+    return new Promise(resolve => {
+      const timer = setTimeout(() => { demoTradeHook = null; resolve(null); }, timeoutMs);
+      demoTradeHook = t => { clearTimeout(timer); demoTradeHook = null; resolve(t); };
+    });
+  }
+
+  // every demo order is remembered in localStorage before anything else can go
+  // wrong: an interrupted run (closed tab, rejection mid-script) would otherwise
+  // leave resting orders holding the maker's funds forever, and each stuck order
+  // makes the next run more likely to be rejected for insufficient funds
+  const DEMO_ORDERS_KEY = 'demo-open-orders';
+
+  function rememberDemoOrder(userId, orderId) {
+    try {
+      const open = JSON.parse(localStorage.getItem(DEMO_ORDERS_KEY) || '[]');
+      open.push({ userId, orderId });
+      localStorage.setItem(DEMO_ORDERS_KEY, JSON.stringify(open));
+    } catch (e) { /* private mode etc: the finally-sweep still covers this run */ }
+  }
+
+  async function sweepDemoOrders() {
+    let open = [];
+    try {
+      open = JSON.parse(localStorage.getItem(DEMO_ORDERS_KEY) || '[]');
+      localStorage.setItem(DEMO_ORDERS_KEY, '[]');
+    } catch (e) { return; }
+    for (const o of open) {
+      await fetch('/api/cancel', { method: 'POST', body: JSON.stringify({ orderId: o.orderId, userId: o.userId, symbol: SYMBOL }) });
+    }
+  }
+
+  async function demoOrder(userId, orderSide, priceTicks, quantity) {
+    const res = await fetch('/api/orders', {
+      method: 'POST',
+      body: JSON.stringify({ userId, symbol: SYMBOL, side: orderSide, priceTicks, quantity })
+    });
+    if (!res.ok) throw new Error(await res.text());
+    const orderId = (await res.json()).orderId;
+    rememberDemoOrder(userId, orderId);
+    return orderId;
+  }
+
+  // the sell-back leg needs the BTC from the buy leg, and settlement of that
+  // fill is async; one retry after a pause absorbs the lag
+  async function demoOrderRetry(userId, orderSide, priceTicks, quantity) {
+    try {
+      return await demoOrder(userId, orderSide, priceTicks, quantity);
+    } catch (e) {
+      await sleep(2500);
+      return demoOrder(userId, orderSide, priceTicks, quantity);
+    }
+  }
+
+  async function runDemo() {
+    await sweepDemoOrders();   // release funds still held by earlier interrupted runs
+    const trader = $('user').value || 'alice';
+    // the other funded demo account plays market maker, so the two sides are never the same user
+    const maker = trader === 'bob' ? 'alice' : 'bob';
+    // price around whatever the book looks like right now, so the demo behaves
+    // the same on an empty book and on one other visitors have been filling
+    const bid = levels(bids, true)[0], ask = levels(asks, false)[0];
+    const mid = bid && ask ? Math.round((bid.priceTicks + ask.priceTicks) / 2)
+      : bid ? bid.priceTicks + 100
+      : ask ? ask.priceTicks - 100
+      : 10000;
+    const askLo = mid + 50, askHi = mid + 100, bidPx = mid - 50;
+
+    dots(1);
+    demoStep('A market maker posts resting sell orders. Watch them land in the order book.',
+      'placed as ' + maker + ', the other funded demo account');
+    await demoOrder(maker, 'SELL', askLo, 2);
+    await demoOrder(maker, 'SELL', askHi, 2);
+    flash('book');
+    await sleep(3000);
+
+    dots(2);
+    demoStep('Now a resting buy underneath. The gap between best bid and best ask is the spread.',
+      'nobody trades yet because the prices do not cross');
+    await demoOrder(maker, 'BUY', bidPx, 4);
+    flash('book');
+    await sleep(3000);
+
+    dots(3);
+    demoStep(trader + ' buys 2 at the best ask. That crosses the spread, so the engine matches it.',
+      'waiting for the fill to come back over the websocket');
+    let tradeWait = nextTrade(6000);
+    await demoOrder(trader, 'BUY', askLo, 2);
+    let trade = await tradeWait;
+    flash('trades');
+    if (trade) {
+      demoStep('Filled: ' + trade.quantity + ' at $' + dollars(trade.priceTicks) + ', printed on the tape.',
+        'that row came from the matching engine, not from this script');
+    }
+    await sleep(3000);
+
+    dots(4);
+    demoStep('The fill moved real money. ' + trader + ' paid dollars and received BTC.',
+      'the gateway held the funds up front in TigerBeetle and settlement released them on the fill');
+    refreshBalances();
+    flash('balances');
+    await sleep(4000);
+
+    dots(5);
+    demoStep('To finish, ' + trader + ' sells the 2 BTC back into the resting bid.',
+      maker + ' keeps the spread on the round trip, which is how market makers get paid');
+    tradeWait = nextTrade(6000);
+    await demoOrderRetry(trader, 'SELL', bidPx, 2);
+    await tradeWait;
+    flash('trades');
+    await sleep(3000);
+
+    // put the book back the way we found it so runs do not stack levels
+    await sweepDemoOrders();
+    demoStep('Done. Book reset, and every step you just watched ran through the real venue.',
+      'full path: gateway holds funds, kafka log, matching engine, kafka again, market data, this page');
+  }
+
+  $('demoRun').onclick = async () => {
+    const btn = $('demoRun');
+    btn.disabled = true;
+    btn.textContent = 'Running';
+    try {
+      await runDemo();
+    } catch (e) {
+      demoStep('The demo hit a snag: ' + e.message,
+        'the exchange itself is still live, try the ticket below');
+      await sweepDemoOrders();   // a failed run must not keep holding the maker's funds
+    }
+    btn.textContent = 'Run again';
+    btn.disabled = false;
+  };
 
   connect();
   refreshBalances();

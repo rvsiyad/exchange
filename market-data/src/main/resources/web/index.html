@@ -248,16 +248,55 @@
     });
   }
 
+  // every demo order is remembered in localStorage before anything else can go
+  // wrong: an interrupted run (closed tab, rejection mid-script) would otherwise
+  // leave resting orders holding the maker's funds forever, and each stuck order
+  // makes the next run more likely to be rejected for insufficient funds
+  const DEMO_ORDERS_KEY = 'demo-open-orders';
+
+  function rememberDemoOrder(userId, orderId) {
+    try {
+      const open = JSON.parse(localStorage.getItem(DEMO_ORDERS_KEY) || '[]');
+      open.push({ userId, orderId });
+      localStorage.setItem(DEMO_ORDERS_KEY, JSON.stringify(open));
+    } catch (e) { /* private mode etc: the finally-sweep still covers this run */ }
+  }
+
+  async function sweepDemoOrders() {
+    let open = [];
+    try {
+      open = JSON.parse(localStorage.getItem(DEMO_ORDERS_KEY) || '[]');
+      localStorage.setItem(DEMO_ORDERS_KEY, '[]');
+    } catch (e) { return; }
+    for (const o of open) {
+      await fetch('/api/cancel', { method: 'POST', body: JSON.stringify({ orderId: o.orderId, userId: o.userId, symbol: SYMBOL }) });
+    }
+  }
+
   async function demoOrder(userId, orderSide, priceTicks, quantity) {
     const res = await fetch('/api/orders', {
       method: 'POST',
       body: JSON.stringify({ userId, symbol: SYMBOL, side: orderSide, priceTicks, quantity })
     });
     if (!res.ok) throw new Error(await res.text());
-    return (await res.json()).orderId;
+    const orderId = (await res.json()).orderId;
+    rememberDemoOrder(userId, orderId);
+    return orderId;
+  }
+
+  // the sell-back leg needs the BTC from the buy leg, and settlement of that
+  // fill is async; one retry after a pause absorbs the lag
+  async function demoOrderRetry(userId, orderSide, priceTicks, quantity) {
+    try {
+      return await demoOrder(userId, orderSide, priceTicks, quantity);
+    } catch (e) {
+      await sleep(2500);
+      return demoOrder(userId, orderSide, priceTicks, quantity);
+    }
   }
 
   async function runDemo() {
+    await sweepDemoOrders();   // release funds still held by earlier interrupted runs
     const trader = $('user').value || 'alice';
     // the other funded demo account plays market maker, so the two sides are never the same user
     const maker = trader === 'bob' ? 'alice' : 'bob';
@@ -269,20 +308,19 @@
       : ask ? ask.priceTicks - 100
       : 10000;
     const askLo = mid + 50, askHi = mid + 100, bidPx = mid - 50;
-    const makerOrders = [];
 
     dots(1);
     demoStep('A market maker posts resting sell orders. Watch them land in the order book.',
       'placed as ' + maker + ', the other funded demo account');
-    makerOrders.push(await demoOrder(maker, 'SELL', askLo, 2));
-    makerOrders.push(await demoOrder(maker, 'SELL', askHi, 2));
+    await demoOrder(maker, 'SELL', askLo, 2);
+    await demoOrder(maker, 'SELL', askHi, 2);
     flash('book');
     await sleep(3000);
 
     dots(2);
     demoStep('Now a resting buy underneath. The gap between best bid and best ask is the spread.',
       'nobody trades yet because the prices do not cross');
-    makerOrders.push(await demoOrder(maker, 'BUY', bidPx, 4));
+    await demoOrder(maker, 'BUY', bidPx, 4);
     flash('book');
     await sleep(3000);
 
@@ -310,15 +348,13 @@
     demoStep('To finish, ' + trader + ' sells the 2 BTC back into the resting bid.',
       maker + ' keeps the spread on the round trip, which is how market makers get paid');
     tradeWait = nextTrade(6000);
-    await demoOrder(trader, 'SELL', bidPx, 2);
+    await demoOrderRetry(trader, 'SELL', bidPx, 2);
     await tradeWait;
     flash('trades');
     await sleep(3000);
 
     // put the book back the way we found it so runs do not stack levels
-    for (const orderId of makerOrders) {
-      await fetch('/api/cancel', { method: 'POST', body: JSON.stringify({ orderId, userId: maker, symbol: SYMBOL }) });
-    }
+    await sweepDemoOrders();
     demoStep('Done. Book reset, and every step you just watched ran through the real venue.',
       'full path: gateway holds funds, kafka log, matching engine, kafka again, market data, this page');
   }
@@ -332,6 +368,7 @@
     } catch (e) {
       demoStep('The demo hit a snag: ' + e.message,
         'the exchange itself is still live, try the ticket below');
+      await sweepDemoOrders();   // a failed run must not keep holding the maker's funds
     }
     btn.textContent = 'Run again';
     btn.disabled = false;
